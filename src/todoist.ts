@@ -25,21 +25,32 @@ export interface Section { // Add export
     // Add other section properties if needed
 }
 
+// Interface for the Due date object
+export interface Due {
+    date: string;
+    string: string; // <-- Add string property
+    datetime?: string | null; // Optional: Add datetime if needed
+    timezone?: string | null; // Optional: Add timezone if needed
+    is_recurring: boolean;
+}
+
+// Interface for a Todoist Task (Item)
 export interface Item { // Add export - Todoist calls tasks "items" in the Sync API
     id: string;
-    content?: string; // Make optional as deleted items might lack it
-    description?: string; // Make optional
-    project_id?: string; // Make optional
-    section_id?: string | null; // Make optional
-    completed_at?: string | null; // Make optional
-    labels?: string[]; // Make optional
-    priority?: number; // Make optional
-    due?: { date: string; } | null; // Make optional
-    url?: string; // Make optional
-    added_at?: string; // Make optional
-    parent_id?: string | null; // Make optional
-    is_deleted?: boolean; // Add this optional field
-    // Add other item properties if needed
+    content: string;
+    description: string;
+    project_id: string;
+    section_id?: string | null; // Sections can be null
+    priority: number;
+    due?: Due | null; // Make sure Due interface is updated
+    labels: string[];
+    url: string;
+    parent_id?: string | null; // Parent ID can be null
+    completed_at?: string | null; // Completion timestamp can be null
+    created_at: string; // <-- Add created_at property
+    is_deleted: boolean; // Add is_deleted based on sync data structure
+    // Add any other relevant fields from the API response
+    // e.g., order, comment_count, assignee_id, assigner_id, duration
 }
 
 // Interface for the main Sync API response structure
