@@ -72,6 +72,24 @@ interface ProjectDataResponse {
 }
 // --- End Interfaces ---
 
+// --- Sync API Command Interfaces ---
+export interface TodoistCommand { // Add export
+    type: string;
+    uuid: string;
+    temp_id?: string; // Optional: Used for adding items
+    args: any;
+}
+
+export interface ItemCompleteArgs { // Add export
+    id: string;
+}
+
+// --- Sync API Response Interfaces ---
+interface SyncCommandResponse {
+    sync_token: string;
+    sync_status: { [uuid: string]: "ok" | { error_code: number; error: string } };
+    temp_id_mapping?: { [temp_id: string]: string };
+}
 
 // Function to get the sync token file path
 export function getSyncTokenFilePath(app: App): string {
@@ -287,6 +305,97 @@ async function getProjectData(apiKey: string, projectId: string): Promise<Projec
     } catch (error) {
         console.error(`[Todoist Sync] Error fetching project data for ${projectId}:`, error);
         return null;
+    }
+}
+
+// --- Function to Post Commands to Todoist Sync API ---
+export async function postTodoistCommands(
+    app: App,
+    apiKey: string,
+    commands: TodoistCommand[]
+): Promise<{ success: boolean; syncStatus?: SyncCommandResponse['sync_status']; error?: any }> {
+
+    if (!apiKey) {
+        console.error("[Todoist Sync] API Key is missing for posting commands.");
+        new Notice("Todoist API Key is missing.");
+        return { success: false, error: "API Key missing" };
+    }
+    if (commands.length === 0) {
+        console.log("[Todoist Sync] No commands to post.");
+        return { success: true }; // Nothing to do
+    }
+
+    const relativePath = getSyncTokenFileRelativePath(app); // For saving new token
+
+    try {
+        const requestBody = new URLSearchParams({
+            commands: JSON.stringify(commands)
+        });
+
+        console.log(`[Todoist Sync] Sending ${commands.length} command(s) to ${TODOIST_SYNC_API_URL}`);
+        // console.debug("[Todoist Sync] Commands:", JSON.stringify(commands)); // Optional detailed logging
+
+        const response = await fetch(TODOIST_SYNC_API_URL, {
+            method: "POST",
+            headers: {
+                "Authorization": `Bearer ${apiKey}`,
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: requestBody
+        });
+
+        console.log(`[Todoist Sync] Received command response status: ${response.status}`);
+
+        if (!response.ok) {
+            const errorBody = await response.text();
+            console.error("[Todoist Sync] Command API request failed:", response.status, response.statusText, errorBody);
+            new Notice(`Todoist command failed: ${response.statusText}`);
+            return { success: false, error: `API Error ${response.status}: ${response.statusText}` };
+        }
+
+        const data = await response.json() as SyncCommandResponse;
+        console.log("[Todoist Sync] Command API response processed.");
+        // console.debug("[Todoist Sync] Command Response Data:", JSON.stringify(data, null, 2)); // Optional detailed logging
+
+        // --- CRITICAL: Save the new sync token immediately ---
+        if (data && data.sync_token) {
+            const new_syncToken = data.sync_token;
+            console.log(`[Todoist Sync] Saving new sync token after command: ${new_syncToken.substring(0, 10)}...`);
+            try {
+                await app.vault.adapter.write(relativePath, new_syncToken);
+                console.log(`[Todoist Sync] Successfully wrote new sync token via adapter to ${relativePath}`);
+            } catch (writeError) {
+                 console.error(`[Todoist Sync] Error writing new sync token via adapter to ${relativePath}:`, writeError);
+                 new Notice("Error saving new Todoist sync token after command. Check console.");
+                 // Even if saving fails, the command likely succeeded on Todoist's side.
+                 // The next read sync might fetch redundant data, but it's better than losing the command status.
+            }
+        } else {
+            console.warn("[Todoist Sync] No sync_token received in command response.");
+            // This is unexpected and might indicate an issue.
+        }
+
+        // --- Check command status ---
+        let allOk = true;
+        if (data.sync_status) {
+            for (const uuid in data.sync_status) {
+                if (data.sync_status[uuid] !== "ok") {
+                    allOk = false;
+                    const errorInfo = data.sync_status[uuid] as { error_code: number; error: string }; // Type assertion
+                    console.error(`[Todoist Sync] Command ${uuid} failed:`, errorInfo.error_code, errorInfo.error);
+                    new Notice(`Todoist command failed: ${errorInfo.error}`);
+                } else {
+                    console.log(`[Todoist Sync] Command ${uuid} successful.`);
+                }
+            }
+        }
+
+        return { success: allOk, syncStatus: data.sync_status };
+
+    } catch (error) {
+        console.error("[Todoist Sync] Network or parsing error during postTodoistCommands:", error);
+        new Notice("Network error sending Todoist command. Check console.");
+        return { success: false, error: error };
     }
 }
 

@@ -1,9 +1,16 @@
-import { Plugin, TFile, Notice, normalizePath, TAbstractFile, TFolder, App, PluginSettingTab, Setting } from "obsidian"; // Import App, PluginSettingTab, Setting
-// Import interfaces and functions from todoist.ts
-import { fetchTodoistData, Project, Section, Item, getSyncTokenFilePath } from "src/todoist"; // Add imports
+import { Plugin, TFile, Notice, normalizePath, TAbstractFile, TFolder, App, PluginSettingTab, Setting, Vault, CachedMetadata } from "obsidian"; // Add MetadataCache, Vault
+// Import the new function and command interface
+import { fetchTodoistData, postTodoistCommands, Project, Section, Item, getSyncTokenFilePath, TodoistCommand, ItemCompleteArgs } from "src/todoist";
 import * as path from "path";
-// Remove fs import if not used elsewhere in main.ts
-// import * as fs from 'fs';
+
+// --- UUID Generation ---
+function generateUUID(): string {
+    // Basic implementation, consider a robust library like 'uuid' for production
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+        var r = Math.random() * 16 | 0, v = c == 'x' ? r : (r & 0x3 | 0x8);
+        return v.toString(16);
+    });
+}
 
 // Helper function to merge updates into a cache based on ID
 function mergeById<T extends { id: string }>(cache: T[], delta: T[] | undefined): T[] {
@@ -32,10 +39,11 @@ const DEFAULT_SETTINGS: TodoistSyncSettings = {
 }
 
 export default class TodoistSyncPlugin extends Plugin {
-    settings: TodoistSyncSettings; // Add settings property
+    settings: TodoistSyncSettings;
     // Caches for API data
     private cachedProjects: Project[] = [];
     private cachedSections: Section[] = [];
+    private cachedTasks: Item[] = [];
 
     // Caches mapping Todoist ID to Obsidian File Path
     private projectFileCache: Map<string, string> = new Map();
@@ -43,30 +51,48 @@ export default class TodoistSyncPlugin extends Plugin {
     private taskFileCache: Map<string, string> = new Map(); // Keep task cache
 
     private isInitialLoad: boolean = true;
+    private statusBarItemEl: HTMLElement | null = null;
+    // Add a set to track pending commands to avoid duplicates if events fire rapidly
+    private pendingCommands: Map<string, TodoistCommand> = new Map();
+    private obsidianChangeTimeout: NodeJS.Timeout | null = null;
 
     async onload() {
         console.log("[Todoist Plugin] Loading...");
-        await this.loadSettings(); // Load settings first
+        await this.loadSettings();
 
         // Register settings tab
         this.addSettingTab(new TodoistSyncSettingTab(this.app, this));
 
-        // Populate caches after loading settings (uses baseFolder setting)
+        // Add Status Bar Item - this returns HTMLElement
+        this.statusBarItemEl = this.addStatusBarItem();
+        this.statusBarItemEl.setText('Todoist Sync: Ready'); // setText is available on HTMLElement
+
+        // Populate caches
         await this.populateAllCaches();
 
+        // Add Commands
         this.addCommand({
             id: "sync-todoist-tasks",
             name: "Sync with Todoist",
             callback: () => this.syncOrFullSyncTasks(false),
         });
-
         this.addCommand({
             id: "full-sync-todoist-tasks",
             name: "Full Sync with Todoist",
             callback: () => this.syncOrFullSyncTasks(true),
         });
 
-        this.isInitialLoad = true;
+        // --- Register Metadata Cache Change Listener ---
+        this.registerEvent(
+            // Use the imported CachedMetadata type directly
+            this.app.metadataCache.on('changed', (file: TFile, data: string, cache: CachedMetadata) => this.handleMetadataChange(file, data, cache))
+        );
+
+        // --- Register Vault Change Listeners (for future use, e.g., delete/rename) ---
+        // this.registerEvent(this.app.vault.on('delete', this.handleVaultDelete.bind(this)));
+        // this.registerEvent(this.app.vault.on('rename', this.handleVaultRename.bind(this)));
+
+        this.isInitialLoad = true; // Keep this if used elsewhere
     }
 
     async loadSettings() {
@@ -142,9 +168,174 @@ export default class TodoistSyncPlugin extends Plugin {
 
     onunload() {
         console.log("[Todoist Plugin] Unloading...");
-        // TODO: Consider saving caches to a file here
+        // Clear any pending timeout
+        if (this.obsidianChangeTimeout) {
+            clearTimeout(this.obsidianChangeTimeout);
+        }
     }
 
+    // --- Metadata Change Handler ---
+    private handleMetadataChange(file: TFile, data: string, cache: CachedMetadata) {
+        // Basic check: Is it a markdown file?
+        if (file.extension !== 'md') {
+            return;
+        }
+
+        // Check if it's a task file managed by us (using cache for efficiency)
+        const todoistId = this.findTodoistIdByPath(file.path);
+        if (!todoistId) {
+            // console.debug(`[Obsidian Change] Ignoring change in non-task file: ${file.path}`);
+            return;
+        }
+
+        // Get the *new* frontmatter state
+        const newFrontmatter = cache.frontmatter;
+        if (!newFrontmatter || newFrontmatter.type !== 'task') {
+            console.warn(`[Obsidian Change] File ${file.path} has Todoist ID ${todoistId} but missing task frontmatter.`);
+            return;
+        }
+
+        // Get the *previous* state from our internal cache
+        const cachedTask = this.cachedTasks.find(t => String(t.id) === todoistId);
+        if (!cachedTask) {
+            console.warn(`[Obsidian Change] Task ID ${todoistId} from file ${file.path} not found in internal cache.`);
+            return; // Cannot compare state
+        }
+
+        // --- Detect Completion Change ---
+        const wasCompleted = !!cachedTask.completed_at; // Check previous state from cache
+        const isNowCompleted = newFrontmatter.completed === true;
+
+        if (isNowCompleted && !wasCompleted) {
+            console.log(`[Obsidian Change] Detected completion for task ${todoistId} in ${file.path}`);
+            this.queueTodoistCommand({
+                type: "item_complete",
+                uuid: generateUUID(),
+                args: { id: todoistId } as ItemCompleteArgs
+            });
+        }
+        // --- Detect Re-open Change (Optional for now) ---
+        // else if (!isNowCompleted && wasCompleted) {
+        //     console.log(`[Obsidian Change] Detected re-open for task ${todoistId} in ${file.path}`);
+        //     this.queueTodoistCommand({
+        //         type: "item_uncomplete",
+        //         uuid: generateUUID(),
+        //         args: { id: todoistId }
+        //     });
+        // }
+
+        // --- Add other change detections here (due date, priority, etc.) ---
+
+    }
+
+    // --- Helper to find Todoist ID from path cache ---
+    private findTodoistIdByPath(filePath: string): string | null {
+        for (const [id, path] of this.taskFileCache.entries()) {
+            if (path === filePath) {
+                return id;
+            }
+        }
+        return null;
+    }
+
+    // --- Queue and Debounce Commands ---
+    private queueTodoistCommand(command: TodoistCommand) {
+        // Use command type + item ID as key to prevent duplicate actions from rapid events
+        const commandKey = `${command.type}_${command.args.id}`;
+        this.pendingCommands.set(commandKey, command);
+
+        // Clear existing timeout if present
+        if (this.obsidianChangeTimeout) {
+            clearTimeout(this.obsidianChangeTimeout);
+        }
+
+        // Set a new timeout to process commands after a short delay (e.g., 2 seconds)
+        this.obsidianChangeTimeout = setTimeout(() => {
+            this.processPendingCommands();
+        }, 2000); // 2 second debounce window
+    }
+
+    // --- Process Pending Commands ---
+    private async processPendingCommands() {
+        if (this.pendingCommands.size === 0) {
+            return; // Nothing to process
+        }
+
+        // Get commands and clear the pending map
+        const commandsToProcess = Array.from(this.pendingCommands.values());
+        this.pendingCommands.clear();
+        this.obsidianChangeTimeout = null; // Clear timeout reference
+
+        console.log(`[Obsidian Change] Processing ${commandsToProcess.length} queued command(s).`);
+        if (this.statusBarItemEl) this.statusBarItemEl.setText('Todoist Sync: Sending...');
+
+        const result = await postTodoistCommands(this.app, this.settings.apiKey, commandsToProcess);
+
+        if (result.success) {
+            console.log("[Obsidian Change] Commands processed successfully.");
+            // --- Update internal cache AND local files based on successful commands ---
+            if (result.syncStatus) {
+                // Use Promise.allSettled for concurrent file operations
+                const updatePromises = commandsToProcess.map(async (cmd) => {
+                    const status = result.syncStatus![cmd.uuid];
+                    if (status === "ok") {
+                        const taskId = String(cmd.args.id); // Ensure string ID
+
+                        // --- Handle Successful Item Completion ---
+                        if (cmd.type === "item_complete") {
+                            // 1. Update internal API cache
+                            const taskIndex = this.cachedTasks.findIndex(t => String(t.id) === taskId);
+                            if (taskIndex !== -1) {
+                                this.cachedTasks[taskIndex].completed_at = new Date().toISOString(); // Mark as completed locally
+                                console.log(`[Cache Update] Marked task ${taskId} as completed in local API cache.`);
+                            }
+
+                            // 2. Update local file (frontmatter and move)
+                            const filePath = this.taskFileCache.get(taskId);
+                            if (filePath) {
+                                const file = this.app.vault.getAbstractFileByPath(filePath);
+                                if (file instanceof TFile) {
+                                    try {
+                                        console.log(`[Obsidian Change] Updating frontmatter for locally completed task ${taskId} at ${filePath}`);
+                                        await this.app.fileManager.processFrontMatter(file, (fm) => {
+                                            fm.completed = true;
+                                            fm.completed_at = new Date().toISOString();
+                                        });
+
+                                        console.log(`[Obsidian Change] Moving locally completed task ${taskId} to Done folder.`);
+                                        const doneFolderPath = normalizePath(`${this.settings.baseFolder}/${this.settings.doneFolder}`);
+                                        await this.moveFileToCustomLocation(file, doneFolderPath, 'locally completed task file');
+
+                                        // 3. Remove from file cache after successful move
+                                        this.taskFileCache.delete(taskId);
+
+                                    } catch (fileError) {
+                                        console.error(`[Obsidian Change] Error updating/moving file for completed task ${taskId} at ${filePath}:`, fileError);
+                                    }
+                                } else {
+                                    console.warn(`[Obsidian Change] File for completed task ${taskId} not found at cached path ${filePath} during post-command update.`);
+                                    // Remove stale cache entry
+                                    this.taskFileCache.delete(taskId);
+                                }
+                            } else {
+                                console.warn(`[Obsidian Change] File path for completed task ${taskId} not found in cache during post-command update.`);
+                            }
+                        }
+                        // --- Add logic for other command types (item_uncomplete, item_update, etc.) here ---
+                        // Example: If item_uncomplete succeeds, update cache, update frontmatter (completed: false, completed_at: null), move file back from Done folder?
+                    }
+                });
+                // Wait for all file operations to settle
+                await Promise.allSettled(updatePromises);
+            }
+            if (this.statusBarItemEl) this.statusBarItemEl.setText(`Todoist Synced: ${new Date().toLocaleTimeString()}`); // Update status bar on success
+
+        } else {
+            console.error("[Obsidian Change] Failed to process commands:", result.error);
+            new Notice("Failed to send changes to Todoist. Check console.");
+            if (this.statusBarItemEl) this.statusBarItemEl.setText('Todoist Sync: Error'); // Update status bar on failure
+        }
+    }
 
     // Combined function for sync and full sync
     async syncOrFullSyncTasks(isFullSync: boolean) {
@@ -155,563 +346,606 @@ export default class TodoistSyncPlugin extends Plugin {
             return;
         }
 
+        // Update Status Bar - Start
+        if (this.statusBarItemEl) {
+            this.statusBarItemEl.setText('Todoist Sync: Syncing...');
+            this.statusBarItemEl.addClass('syncing'); // Optional: Add class for styling
+        }
+
         const syncType = isFullSync ? 'full' : 'incremental';
         console.log(`[Obsidian Sync] Starting ${syncType} Todoist sync...`);
         new Notice(`Starting ${syncType} Todoist sync...`);
 
         const vault = this.app.vault;
+        let syncErrorOccurred = false; // Flag to track errors
 
-        // --- Check if cache is needed and empty ---
-        // Force full sync if any cache is empty on first load
-        if (!isFullSync && this.isInitialLoad && (this.projectFileCache.size === 0 || this.sectionFileCache.size === 0 || this.taskFileCache.size === 0)) {
-            console.warn("[Obsidian Sync] Incremental sync attempted without cached data. Performing initial full sync first.");
-            new Notice("Performing initial full sync first...");
-            isFullSync = true;
-            await this.populateAllCaches(); // Ensure caches are populated
-        }
-
-        // --- Fetch Data ---
-        let fetchedData;
-        try {
-            // Call fetchTodoistData directly, passing apiKey and app
-            fetchedData = await fetchTodoistData(this.settings.apiKey, this.app, isFullSync);
-        }
-        catch (error) {
-            console.error("[Obsidian Sync] Error fetching data:", error);
-            new Notice("Error fetching data from Todoist. Check console.");
-            return;
-        }
-        if (!fetchedData) {
-             new Notice("Failed to fetch data from Todoist. Check API key and console.");
-             return;
-        }
-
-        // --- Create Sets of IDs from fetched data for quick lookup (only for incremental) ---
-        const projectIdsInDelta = new Set<string>();
-        const sectionIdsInDelta = new Set<string>();
-        if (!isFullSync) {
-            fetchedData.projects?.forEach(p => projectIdsInDelta.add(p.id));
-            fetchedData.sections?.forEach(s => sectionIdsInDelta.add(s.id));
-            console.log(`[Obsidian Sync] Incremental delta includes ${projectIdsInDelta.size} projects and ${sectionIdsInDelta.size} sections.`);
-        }
-
-        // --- Determine Data for Lookups and Update API Data Cache ---
-        // We still need the API data cache for incremental merges
-        let lookupProjectsApi: Project[];
-        let lookupSectionsApi: Section[];
-        const tasksToProcess: Item[] = fetchedData.tasks;
-
-        if (isFullSync) {
-            lookupProjectsApi = fetchedData.projects;
-            lookupSectionsApi = fetchedData.sections;
-            this.cachedProjects = lookupProjectsApi; // Update API data cache
-            this.cachedSections = lookupSectionsApi; // Update API data cache
-            this.isInitialLoad = false;
-            console.log(`[Cache] Full sync: Updated API data cache with ${this.cachedProjects.length} projects, ${this.cachedSections.length} sections.`);
-            // Repopulate file caches after full sync for maximum accuracy
-            await this.populateAllCaches();
-        } else {
-            // Use existing API data cache for lookups before merging
-            lookupProjectsApi = this.cachedProjects;
-            lookupSectionsApi = this.cachedSections;
-            // Merge changes into the API data cache
-            if (fetchedData.projects.length > 0) { this.cachedProjects = mergeById(this.cachedProjects, fetchedData.projects); }
-            if (fetchedData.sections.length > 0) { this.cachedSections = mergeById(this.cachedSections, fetchedData.sections); }
-            // Re-assign lookups to potentially updated API cache
-            lookupProjectsApi = this.cachedProjects;
-            lookupSectionsApi = this.cachedSections;
-            console.log(`[Cache] Incremental sync: Using ${lookupProjectsApi.length} projects, ${lookupSectionsApi.length} sections from API data cache.`);
-        }
-
-        // --- Ensure Base, Trash, Archive, and Done Folders Exist ---
-        const baseFolderPath = this.settings.baseFolder;
-        const trashFolderPath = normalizePath(`${baseFolderPath}/${this.settings.trashFolder}`);
-        const archiveFolderPath = normalizePath(`${baseFolderPath}/${this.settings.archiveFolder}`);
-        const doneFolderPath = normalizePath(`${baseFolderPath}/${this.settings.doneFolder}`); // Define Done folder path
-        try {
-            // Ensure Base folder
-            if (!vault.getAbstractFileByPath(baseFolderPath)) {
-                await vault.createFolder(baseFolderPath);
-                console.log(`[Obsidian Sync] Created base folder: ${baseFolderPath}`);
+        try { // Wrap main sync logic in try...finally
+            // --- Check if cache is needed and empty ---
+            // Force full sync if any cache is empty on first load
+            if (!isFullSync && this.isInitialLoad && (this.projectFileCache.size === 0 || this.sectionFileCache.size === 0 || this.taskFileCache.size === 0)) {
+                console.warn("[Obsidian Sync] Incremental sync attempted without cached data. Performing initial full sync first.");
+                new Notice("Performing initial full sync first...");
+                isFullSync = true;
+                await this.populateAllCaches(); // Ensure caches are populated
             }
-            // Ensure Trash folder
-            if (!vault.getAbstractFileByPath(trashFolderPath)) {
-                await vault.createFolder(trashFolderPath);
-                console.log(`[Obsidian Sync] Created custom trash folder: ${trashFolderPath}`);
-            }
-            // Ensure Archive folder
-            if (!vault.getAbstractFileByPath(archiveFolderPath)) {
-                await vault.createFolder(archiveFolderPath);
-                console.log(`[Obsidian Sync] Created custom archive folder: ${archiveFolderPath}`);
-            }
-            // Ensure Done folder (Add this)
-            if (!vault.getAbstractFileByPath(doneFolderPath)) {
-                await vault.createFolder(doneFolderPath);
-                console.log(`[Obsidian Sync] Created custom done folder: ${doneFolderPath}`);
-            }
-        } catch (error) {
-            console.error("[Obsidian Sync] Error ensuring base/trash/archive/done folders exist:", error);
-            new Notice("Error creating base/trash/archive/done folders. Sync aborted.");
-            return;
-        }
-        // --- End Folder Existence Checks ---
 
-
-        // --- Process Projects (Files and Folders) ---
-        console.log("[Obsidian Sync] Processing Projects...");
-        const finalProjectPaths = new Map<string, string>();
-        // Use a copy for iteration if modifying the source cache during loop
-        const projectsToIterate = [...lookupProjectsApi];
-        for (const project of projectsToIterate) { // Iterate over a copy
+            // --- Fetch Data ---
+            let fetchedData;
             try {
-                const projectIdStr = String(project.id);
-                const existingFilePath = this.projectFileCache.get(projectIdStr);
-                let file: TFile | null = null;
-                let itemFolder: TFolder | null = null; // Use TFolder | null
-
-                if (existingFilePath) {
-                    const abstractFile = vault.getAbstractFileByPath(existingFilePath);
-                    if (abstractFile instanceof TFile) {
-                        file = abstractFile;
-                        if (file.parent instanceof TFolder) { // Ensure parent is TFolder
-                           itemFolder = file.parent;
-                        }
-                    } else {
-                        console.warn(`[Cache] Project file not found at ${existingFilePath}. Cache inconsistent.`);
-                        // Attempt to find folder by name if file is missing? Maybe too complex.
-                    }
-                }
-
-                let handled = false; // Flag to indicate if deleted/archived
-
-                // --- Handle Deleted Projects First ---
-                // Only process delete/archive if full sync OR item is in the delta
-                if (project.is_deleted && (isFullSync || projectIdsInDelta.has(projectIdStr))) {
-                    console.log(`[Obsidian Sync] Project ${projectIdStr} marked as deleted by API.`);
-                    // ... move folder/file to trash ...
-                    await this.handleMove(itemFolder, file, trashFolderPath, 'project');
-                    this.projectFileCache.delete(projectIdStr);
-                    // Remove from API cache to prevent reprocessing
-                    this.cachedProjects = this.cachedProjects.filter(p => p.id !== projectIdStr);
-                    handled = true;
-                }
-                // --- Handle Archived Projects ---
-                else if (project.is_archived && (isFullSync || projectIdsInDelta.has(projectIdStr))) {
-                    console.log(`[Obsidian Sync] Project ${projectIdStr} marked as archived by API.`);
-                    // ... move folder/file to archive ...
-                    await this.handleMove(itemFolder, file, archiveFolderPath, 'project');
-                    this.projectFileCache.delete(projectIdStr);
-                    // Remove from API cache to prevent reprocessing
-                    this.cachedProjects = this.cachedProjects.filter(p => p.id !== projectIdStr);
-                    handled = true;
-                }
-
-                // If handled (deleted/archived), skip normal processing
-                if (handled) {
-                    finalProjectPaths.delete(projectIdStr); // Ensure it's not used by children
-                    continue;
-                }
-                // --- End Handle Deleted/Archived Projects ---
-
-
-                // --- Proceed with Normal Create/Update/Rename for non-deleted/archived projects ---
-                const sanitizedName = project.name.toString().replace(/[<>:"/\\|?*]/g, '_');
-                const expectedFolderPath = normalizePath(`${baseFolderPath}/${sanitizedName}`);
-                const expectedFilePath = normalizePath(`${expectedFolderPath}/${sanitizedName}.md`); // Project file path
-
-                let currentFolderPath = expectedFolderPath; // Assume expected path initially
-                const folderAtExpectedPath = vault.getAbstractFileByPath(expectedFolderPath);
-                const existingFolderPath = itemFolder?.path; // Use itemFolder
-
-                // 2. Ensure Folder Exists / Handle Rename
-                if (itemFolder && existingFolderPath && existingFolderPath !== expectedFolderPath) {
-                    // Folder path needs changing
-                    if (!folderAtExpectedPath) {
-                        console.log(`[Obsidian Sync] Renaming project folder from ${existingFolderPath} to ${expectedFolderPath}`);
-                        await this.app.fileManager.renameFile(itemFolder, expectedFolderPath); // Rename itemFolder
-                        currentFolderPath = expectedFolderPath;
-                    } else {
-                        console.warn(`[Obsidian Sync] Cannot rename project folder ${existingFolderPath} to ${expectedFolderPath}, target exists. Using target.`);
-                        currentFolderPath = expectedFolderPath; // Use existing target folder
-                    }
-                } else if (!(folderAtExpectedPath instanceof TFolder)) {
-                    // Folder doesn't exist at expected path, and wasn't found via cache/rename logic
-                    console.log(`[Obsidian Sync] Creating project folder ${currentFolderPath}`);
-                    await vault.createFolder(currentFolderPath);
-                }
-                finalProjectPaths.set(projectIdStr, currentFolderPath); // Store the final folder path
-
-                // 3. Process Project .md File (Conditional Update)
-                if (file) { // Found via cache
-                    // Check if file needs rename (due to folder rename or project name change)
-                    if (file.path !== expectedFilePath) {
-                        console.log(`[Obsidian Sync] Renaming project file from ${file.path} to ${expectedFilePath}`);
-                        try {
-                            // Ensure parent folder exists before renaming project file
-                            const parentFolder = expectedFilePath.substring(0, expectedFilePath.lastIndexOf('/'));
-                            if (!vault.getAbstractFileByPath(parentFolder)) {
-                                await vault.createFolder(parentFolder);
-                            }
-                            await this.app.fileManager.renameFile(file, expectedFilePath);
-                            this.projectFileCache.set(projectIdStr, expectedFilePath); // Update cache
-                            file = vault.getAbstractFileByPath(expectedFilePath) as TFile; // Get new ref
-                        } catch (renameError) {
-                            console.error(`[Obsidian Sync] Failed to rename project file ${file.path}:`, renameError);
-                            // Continue with update at old path? Or skip? Let's skip update if rename fails.
-                            continue;
-                        }
-                    }
-                    // Only update if it's a full sync OR this project was in the delta
-                    if (isFullSync || projectIdsInDelta.has(projectIdStr)) {
-                        await this.updateObsidianProjectFile(project, file);
-                    } else {
-                         // console.log(`[Obsidian Sync] Skipping file update for project ${projectIdStr} (not in delta)`);
-                    }
-                } else { // Create new file (always needs content)
-                    console.log(`[Obsidian Sync] Creating project file: ${expectedFilePath}`);
-                    try {
-                        const newFile = await vault.create(expectedFilePath, "");
-                        await this.updateObsidianProjectFile(project, newFile);
-                        this.projectFileCache.set(projectIdStr, newFile.path); // Add to cache
-                    } catch (createError) {
-                        console.error(`[Obsidian Sync] Failed to create project file ${expectedFilePath}:`, createError);
-                    }
-                }
-
-            } catch (error) {
-                console.error(`[Obsidian Sync] Error processing project ${project.name} (ID: ${project.id}):`, error);
+                // Call fetchTodoistData directly, passing apiKey and app
+                fetchedData = await fetchTodoistData(this.settings.apiKey, this.app, isFullSync);
             }
-        }
-        // Update lookupProjectsApi if cache was modified (important for subsequent section processing)
-        lookupProjectsApi = this.cachedProjects;
-
-
-        // --- Process Sections (Files and Folders) ---
-        console.log("[Obsidian Sync] Processing Sections...");
-        const finalSectionPaths = new Map<string, string>();
-        // Use a copy for iteration
-        const sectionsToIterate = [...lookupSectionsApi];
-        for (const section of sectionsToIterate) { // Iterate over a copy
-             try {
-                const sectionIdStr = String(section.id);
-                const projectIdStr = String(section.project_id);
-                const existingFilePath = this.sectionFileCache.get(sectionIdStr);
-                let file: TFile | null = null;
-                let itemFolder: TFolder | null = null; // Use TFolder | null
-
-                if (existingFilePath) {
-                    const abstractFile = vault.getAbstractFileByPath(existingFilePath);
-                    if (abstractFile instanceof TFile) {
-                        file = abstractFile;
-                         if (file.parent instanceof TFolder) {
-                           itemFolder = file.parent;
-                        }
-                    } else {
-                        console.warn(`[Cache] Stale section cache: File not found at ${existingFilePath} for ID ${sectionIdStr}. Removing.`);
-                        this.sectionFileCache.delete(sectionIdStr);
-                    }
-                }
-
-                let handled = false; // Flag
-
-                // --- Handle Deleted Sections First ---
-                if (section.is_deleted && (isFullSync || sectionIdsInDelta.has(sectionIdStr))) {
-                    console.log(`[Obsidian Sync] Section ${sectionIdStr} marked as deleted by API.`);
-                    // ... move folder/file to trash ...
-                    await this.handleMove(itemFolder, file, trashFolderPath, 'section', true); // Pass checkName=true
-                    this.sectionFileCache.delete(sectionIdStr);
-                    // Remove from API cache
-                    this.cachedSections = this.cachedSections.filter(s => s.id !== sectionIdStr);
-                    handled = true;
-                }
-                // --- Handle Archived Sections ---
-                else if (section.is_archived && (isFullSync || sectionIdsInDelta.has(sectionIdStr))) {
-                     console.log(`[Obsidian Sync] Section ${sectionIdStr} marked as archived by API.`);
-                     // ... move folder/file to archive ...
-                     await this.handleMove(itemFolder, file, archiveFolderPath, 'section', true); // Pass checkName=true
-                     this.sectionFileCache.delete(sectionIdStr);
-                     // Remove from API cache
-                     this.cachedSections = this.cachedSections.filter(s => s.id !== sectionIdStr);
-                     handled = true;
-                }
-
-                // If handled, skip normal processing
-                if (handled) {
-                    finalSectionPaths.delete(sectionIdStr); // Ensure not used by tasks
-                    continue;
-                }
-                // --- End Handle Deleted/Archived Sections ---
-
-
-                // --- Proceed with Normal Create/Update/Rename ---
-                const parentProjectPath = finalProjectPaths.get(projectIdStr); // Get final path of parent project
-
-                if (!parentProjectPath) {
-                    console.warn(`[Obsidian Sync] Skipping section ${section.name} (ID: ${sectionIdStr}): Parent project folder path not found.`);
-                    continue;
-                }
-
-                const sanitizedName = section.name.toString().replace(/[<>:"/\\|?*]/g, '_');
-                const expectedFolderPath = normalizePath(`${parentProjectPath}/${sanitizedName}`);
-                const expectedFilePath = normalizePath(`${expectedFolderPath}/${sanitizedName}.md`); // Section file path
-
-                let currentFolderPath = expectedFolderPath;
-                const folderAtExpectedPath = vault.getAbstractFileByPath(expectedFolderPath);
-                const existingFolderPath = itemFolder?.path;
-
-                // 2. Ensure Folder Exists / Handle Rename (Similar to projects)
-                if (itemFolder && existingFolderPath && existingFolderPath !== expectedFolderPath) {
-                    const folderAtOldPath = vault.getAbstractFileByPath(existingFolderPath);
-                    if (folderAtOldPath instanceof TFolder) {
-                        if (!folderAtExpectedPath) {
-                            console.log(`[Obsidian Sync] Renaming section folder from ${existingFolderPath} to ${expectedFolderPath}`);
-                            await this.app.fileManager.renameFile(itemFolder, expectedFolderPath);
-                            currentFolderPath = expectedFolderPath;
-                             // TODO: Update paths in task cache? Defer.
-                        } else {
-                            console.warn(`[Obsidian Sync] Cannot rename section folder ${existingFolderPath} to ${expectedFolderPath}, target exists. Using target.`);
-                            currentFolderPath = expectedFolderPath;
-                            // TODO: Merge/move files? Defer.
-                        }
-                    } else {
-                         console.warn(`[Obsidian Sync] Old section folder ${existingFolderPath} not found for rename. Assuming ${expectedFolderPath}.`);
-                         currentFolderPath = expectedFolderPath;
-                         if (!(folderAtExpectedPath instanceof TFolder)) {
-                             console.log(`[Obsidian Sync] Creating section folder ${currentFolderPath}`);
-                             await vault.createFolder(currentFolderPath);
-                         }
-                    }
-                } else if (!(folderAtExpectedPath instanceof TFolder)) {
-                    console.log(`[Obsidian Sync] Creating section folder ${currentFolderPath}`);
-                    await vault.createFolder(currentFolderPath);
-                }
-                finalSectionPaths.set(sectionIdStr, currentFolderPath); // Store final folder path
-
-                // 3. Process Section .md File (Conditional Update)
-                if (file) { // Found via cache
-                    if (file.path !== expectedFilePath) {
-                         console.log(`[Obsidian Sync] Renaming section file from ${file.path} to ${expectedFilePath}`);
-                         try {
-                             // Ensure parent folder exists before renaming section file
-                             const parentFolder = expectedFilePath.substring(0, expectedFilePath.lastIndexOf('/'));
-                             if (!vault.getAbstractFileByPath(parentFolder)) {
-                                 await vault.createFolder(parentFolder);
-                             }
-                             await this.app.fileManager.renameFile(file, expectedFilePath);
-                             this.sectionFileCache.set(sectionIdStr, expectedFilePath);
-                             file = vault.getAbstractFileByPath(expectedFilePath) as TFile;
-                         } catch (renameError) { /* ... error handling ... */ return; }
-                    }
-                    // Only update if it's a full sync OR this section was in the delta
-                    if (isFullSync || sectionIdsInDelta.has(sectionIdStr)) {
-                        await this.updateObsidianSectionFile(section, file);
-                    } else {
-                         // console.log(`[Obsidian Sync] Skipping file update for section ${sectionIdStr} (not in delta)`);
-                    }
-                } else { // Create new file (always needs content)
-                    console.log(`[Obsidian Sync] Creating section file: ${expectedFilePath}`);
-                    try {
-                        const newFile = await vault.create(expectedFilePath, "");
-                        await this.updateObsidianSectionFile(section, newFile);
-                        this.sectionFileCache.set(sectionIdStr, newFile.path);
-                    } catch (createError) { /* ... error handling ... */ }
-                }
-
-            } catch (error) {
-                console.error(`[Obsidian Sync] Error processing section ${section.name} (ID: ${section.id}):`, error);
+            catch (error) {
+                console.error("[Obsidian Sync] Error fetching data:", error);
+                new Notice("Error fetching data from Todoist. Check console.");
+                syncErrorOccurred = true; // Set error flag
+                return; // Abort sync
             }
-        }
-         // Update lookupSectionsApi if cache was modified
-        lookupSectionsApi = this.cachedSections;
+            if (!fetchedData) {
+                 new Notice("Failed to fetch data from Todoist. Check API key and console.");
+                 syncErrorOccurred = true; // Set error flag
+                 return; // Abort sync
+            }
+
+            // --- Create Sets of IDs from fetched data for quick lookup (only for incremental) ---
+            const projectIdsInDelta = new Set<string>();
+            const sectionIdsInDelta = new Set<string>();
+            if (!isFullSync) {
+                fetchedData.projects?.forEach(p => projectIdsInDelta.add(p.id));
+                fetchedData.sections?.forEach(s => sectionIdsInDelta.add(s.id));
+                console.log(`[Obsidian Sync] Incremental delta includes ${projectIdsInDelta.size} projects and ${sectionIdsInDelta.size} sections.`);
+            }
+
+            // --- Determine Data for Lookups and Update API Data Cache ---
+            let lookupProjectsApi: Project[];
+            let lookupSectionsApi: Section[];
+            // Use fetched tasks directly for processing this cycle
+            const tasksToProcess: Item[] = fetchedData.tasks || []; // Ensure it's an array
+
+            if (isFullSync) {
+                lookupProjectsApi = fetchedData.projects || []; // Ensure array
+                lookupSectionsApi = fetchedData.sections || []; // Ensure array
+                this.cachedProjects = lookupProjectsApi; // Update API data cache
+                this.cachedSections = lookupSectionsApi; // Update API data cache
+                this.cachedTasks = tasksToProcess; // Update API data cache for tasks
+                this.isInitialLoad = false;
+                console.log(`[Cache] Full sync: Updated API data cache with ${this.cachedProjects.length} projects, ${this.cachedSections.length} sections, ${this.cachedTasks.length} tasks.`);
+                // Repopulate file caches after full sync for maximum accuracy
+                await this.populateAllCaches();
+            } else {
+                // Use existing API data cache for lookups before merging
+                lookupProjectsApi = this.cachedProjects;
+                lookupSectionsApi = this.cachedSections;
+                // Merge changes into the API data cache
+                if (fetchedData.projects && fetchedData.projects.length > 0) {
+                    this.cachedProjects = mergeById(this.cachedProjects, fetchedData.projects);
+                }
+                if (fetchedData.sections && fetchedData.sections.length > 0) {
+                    this.cachedSections = mergeById(this.cachedSections, fetchedData.sections);
+                }
+                // --- Add Task Merging for Incremental Sync ---
+                if (tasksToProcess.length > 0) {
+                    console.log(`[Cache] Incremental sync: Merging ${tasksToProcess.length} task changes into API data cache.`);
+                    this.cachedTasks = mergeById(this.cachedTasks, tasksToProcess);
+                }
+                // --- End Task Merging ---
+
+                // Re-assign lookups to potentially updated API cache (though not strictly needed if mergeById modifies in place)
+                lookupProjectsApi = this.cachedProjects;
+                lookupSectionsApi = this.cachedSections;
+                console.log(`[Cache] Incremental sync: Using ${lookupProjectsApi.length} projects, ${lookupSectionsApi.length} sections, ${this.cachedTasks.length} tasks from API data cache.`);
+            }
+
+            // --- Ensure Base, Trash, Archive, and Done Folders Exist ---
+            const baseFolderPath = this.settings.baseFolder;
+            const trashFolderPath = normalizePath(`${baseFolderPath}/${this.settings.trashFolder}`);
+            const archiveFolderPath = normalizePath(`${baseFolderPath}/${this.settings.archiveFolder}`);
+            const doneFolderPath = normalizePath(`${baseFolderPath}/${this.settings.doneFolder}`); // Define Done folder path
+            try {
+                // Ensure Base folder
+                if (!vault.getAbstractFileByPath(baseFolderPath)) {
+                    await vault.createFolder(baseFolderPath);
+                    console.log(`[Obsidian Sync] Created base folder: ${baseFolderPath}`);
+                }
+                // Ensure Trash folder
+                if (!vault.getAbstractFileByPath(trashFolderPath)) {
+                    await vault.createFolder(trashFolderPath);
+                    console.log(`[Obsidian Sync] Created custom trash folder: ${trashFolderPath}`);
+                }
+                // Ensure Archive folder
+                if (!vault.getAbstractFileByPath(archiveFolderPath)) {
+                    await vault.createFolder(archiveFolderPath);
+                    console.log(`[Obsidian Sync] Created custom archive folder: ${archiveFolderPath}`);
+                }
+                // Ensure Done folder (Add this)
+                if (!vault.getAbstractFileByPath(doneFolderPath)) {
+                    await vault.createFolder(doneFolderPath);
+                    console.log(`[Obsidian Sync] Created custom done folder: ${doneFolderPath}`);
+                }
+            } catch (error) {
+                console.error("[Obsidian Sync] Error ensuring base/trash/archive/done folders exist:", error);
+                new Notice("Error creating base/trash/archive/done folders. Sync aborted.");
+                syncErrorOccurred = true; // Set error flag
+                return; // Abort sync
+            }
+            // --- End Folder Existence Checks ---
 
 
-        // --- Process Tasks ---
-        console.log("[Obsidian Sync] Processing Tasks...");
-        if (!tasksToProcess || tasksToProcess.length === 0) { /* ... log no tasks ... */ }
-        else {
-            const taskProcessingPromises = tasksToProcess.map(async (task) => {
+            // --- Process Projects (Files and Folders) ---
+            console.log("[Obsidian Sync] Processing Projects...");
+            const finalProjectPaths = new Map<string, string>();
+            // Use a copy for iteration if modifying the source cache during loop
+            const projectsToIterate = [...lookupProjectsApi];
+            for (const project of projectsToIterate) { // Iterate over a copy
                 try {
-                    const taskIdStr = String(task.id);
-                    const existingFilePath = this.taskFileCache.get(taskIdStr);
-                    let taskFile: TFile | null = null;
+                    const projectIdStr = String(project.id);
+                    const existingFilePath = this.projectFileCache.get(projectIdStr);
+                    let file: TFile | null = null;
+                    let itemFolder: TFolder | null = null; // Use TFolder | null
 
-                    // --- Handle Deleted Tasks First ---
-                    if (task.is_deleted) {
-                        console.log(`[Obsidian Sync] Task ${taskIdStr} marked as deleted by API.`);
-                        if (existingFilePath) {
-                            const file = this.app.vault.getAbstractFileByPath(existingFilePath);
-                            if (file instanceof TFile) {
-                                try {
-                                    // 1. Update frontmatter to mark as deleted
-                                    console.log(`[Obsidian Sync] Updating frontmatter for deleted task ${taskIdStr} before moving.`);
-                                    await this.app.fileManager.processFrontMatter(file, (fm) => {
-                                        fm['is_deleted'] = true; // Add/update the deleted flag
-                                        // Optionally add a timestamp
-                                        // fm['deleted_at'] = new Date().toISOString();
-                                        // Ensure other fields are NOT overwritten by minimal task data
-                                    });
-
-                                    // 2. Move the updated file to Trash folder
-                                    await this.moveFileToCustomLocation(file, trashFolderPath, 'deleted task file');
-
-                                } catch (deleteProcessError) {
-                                     console.error(`[Obsidian Sync] Error processing deletion (update/move) for task ${taskIdStr} at ${existingFilePath}:`, deleteProcessError);
-                                     // Decide if we should still remove from cache even if move failed
-                                }
-                            } else {
-                                console.warn(`[Obsidian Sync] File for deleted task ${taskIdStr} not found at cached path ${existingFilePath}.`);
-                            }
-                            // 3. Remove from cache after handling deletion attempt
-                            this.taskFileCache.delete(taskIdStr);
-                        } else {
-                            console.log(`[Obsidian Sync] Deleted task ${taskIdStr} not found in cache. No file action needed.`);
-                        }
-                        return; // Stop processing this task further
-                    }
-                    // --- End Handle Deleted Tasks ---
-
-                    // --- Find Existing File (needed for both completed and active tasks) ---
                     if (existingFilePath) {
-                        const file = vault.getAbstractFileByPath(existingFilePath);
-                        if (file instanceof TFile) {
-                            taskFile = file;
+                        const abstractFile = vault.getAbstractFileByPath(existingFilePath);
+                        if (abstractFile instanceof TFile) {
+                            file = abstractFile;
+                            if (file.parent instanceof TFolder) { // Ensure parent is TFolder
+                               itemFolder = file.parent;
+                            }
                         } else {
-                            console.warn(`[Cache] Stale task cache: File not found at ${existingFilePath} for ID ${taskIdStr}. Removing.`);
-                            this.taskFileCache.delete(taskIdStr);
-                            // taskFile remains null
+                            console.warn(`[Cache] Project file not found at ${existingFilePath}. Cache inconsistent.`);
+                            // Attempt to find folder by name if file is missing? Maybe too complex.
                         }
                     }
 
-                    // --- Handle Completed Tasks ---
-                    if (task.completed_at) {
-                        console.log(`[Obsidian Sync] Task ${taskIdStr} marked as completed by API.`);
-                        if (taskFile) { // Check if we found the file
-                            console.log(`[Obsidian Sync] Updating frontmatter for completed task ${taskIdStr} before moving.`);
-                            // 1. Update frontmatter first
-                            await this.updateObsidianTask(task, taskFile);
+                    let handled = false; // Flag to indicate if deleted/archived
 
-                            console.log(`[Obsidian Sync] Moving completed task ${taskIdStr} to Done folder.`);
-                            // 2. Move the updated file to Done folder
-                            await this.moveFileToCustomLocation(taskFile, doneFolderPath, 'completed task file');
+                    // --- Handle Deleted Projects First ---
+                    // Only process delete/archive if full sync OR item is in the delta
+                    if (project.is_deleted && (isFullSync || projectIdsInDelta.has(projectIdStr))) {
+                        console.log(`[Obsidian Sync] Project ${projectIdStr} marked as deleted by API.`);
+                        // ... move folder/file to trash ...
+                        await this.handleMove(itemFolder, file, trashFolderPath, 'project');
+                        this.projectFileCache.delete(projectIdStr);
+                        // Remove from API cache to prevent reprocessing
+                        this.cachedProjects = this.cachedProjects.filter(p => p.id !== projectIdStr);
+                        handled = true;
+                    }
+                    // --- Handle Archived Projects ---
+                    else if (project.is_archived && (isFullSync || projectIdsInDelta.has(projectIdStr))) {
+                        console.log(`[Obsidian Sync] Project ${projectIdStr} marked as archived by API.`);
+                        // ... move folder/file to archive ...
+                        await this.handleMove(itemFolder, file, archiveFolderPath, 'project');
+                        this.projectFileCache.delete(projectIdStr);
+                        // Remove from API cache to prevent reprocessing
+                        this.cachedProjects = this.cachedProjects.filter(p => p.id !== projectIdStr);
+                        handled = true;
+                    }
 
-                            // 3. Remove from cache after successful update and move attempt
-                            this.taskFileCache.delete(taskIdStr);
+                    // If handled (deleted/archived), skip normal processing
+                    if (handled) {
+                        finalProjectPaths.delete(projectIdStr); // Ensure it's not used by children
+                        continue;
+                    }
+                    // --- End Handle Deleted/Archived Projects ---
 
+
+                    // --- Proceed with Normal Create/Update/Rename for non-deleted/archived projects ---
+                    const sanitizedName = project.name.toString().replace(/[<>:"/\\|?*]/g, '_');
+                    const expectedFolderPath = normalizePath(`${baseFolderPath}/${sanitizedName}`);
+                    const expectedFilePath = normalizePath(`${expectedFolderPath}/${sanitizedName}.md`); // Project file path
+
+                    let currentFolderPath = expectedFolderPath; // Assume expected path initially
+                    const folderAtExpectedPath = vault.getAbstractFileByPath(expectedFolderPath);
+                    const existingFolderPath = itemFolder?.path; // Use itemFolder
+
+                    // 2. Ensure Folder Exists / Handle Rename
+                    if (itemFolder && existingFolderPath && existingFolderPath !== expectedFolderPath) {
+                        // Folder path needs changing
+                        if (!folderAtExpectedPath) {
+                            console.log(`[Obsidian Sync] Renaming project folder from ${existingFolderPath} to ${expectedFolderPath}`);
+                            await this.app.fileManager.renameFile(itemFolder, expectedFolderPath); // Rename itemFolder
+                            currentFolderPath = expectedFolderPath;
                         } else {
-                            console.log(`[Obsidian Sync] Completed task ${taskIdStr} has no corresponding file in vault/cache. No file action needed.`);
-                            // Remove from cache if it somehow existed but file didn't
-                            if (existingFilePath) this.taskFileCache.delete(taskIdStr);
+                            console.warn(`[Obsidian Sync] Cannot rename project folder ${existingFolderPath} to ${expectedFolderPath}, target exists. Using target.`);
+                            currentFolderPath = expectedFolderPath; // Use existing target folder
                         }
-                        return; // Stop processing this task further (don't attempt regular update/rename)
+                    } else if (!(folderAtExpectedPath instanceof TFolder)) {
+                        // Folder doesn't exist at expected path, and wasn't found via cache/rename logic
+                        console.log(`[Obsidian Sync] Creating project folder ${currentFolderPath}`);
+                        await vault.createFolder(currentFolderPath);
                     }
-                    // --- End Handle Completed Tasks ---
+                    finalProjectPaths.set(projectIdStr, currentFolderPath); // Store the final folder path
 
-
-                    // --- Proceed with Normal Create/Update/Rename for non-deleted, non-completed tasks ---
-
-                    // 2. Calculate expected path (moved this down, only needed for active tasks)
-                    const sanitizedContent = (task.content || `Untitled Task ${taskIdStr}`).replace(/[<>:"/\\|?*]/g, '_').substring(0, 100);
-                    let parentFolderPath: string | undefined;
-                    if (task.section_id) {
-                        parentFolderPath = finalSectionPaths.get(String(task.section_id));
-                    }
-                    if (!parentFolderPath && task.project_id) {
-                        parentFolderPath = finalProjectPaths.get(String(task.project_id));
-                    }
-                    // Fallback to base folder if no parent project/section path found (should be rare)
-                    if (!parentFolderPath) {
-                        console.warn(`[Obsidian Sync] Task ${taskIdStr} has no parent project/section path. Using base folder.`);
-                        parentFolderPath = baseFolderPath;
-                    }
-                    const expectedFilePath = normalizePath(`${parentFolderPath}/${sanitizedContent}.md`);
-
-
-                    // 3. Process Task .md File (Rename/Update/Create) - Only if NOT completed
-                    if (taskFile) { // Found via cache and not completed
-                        if (taskFile.path !== expectedFilePath) {
-                            console.log(`[Obsidian Sync] Renaming task file from ${taskFile.path} to ${expectedFilePath}`);
+                    // 3. Process Project .md File (Conditional Update)
+                    if (file) { // Found via cache
+                        // Check if file needs rename (due to folder rename or project name change)
+                        if (file.path !== expectedFilePath) {
+                            console.log(`[Obsidian Sync] Renaming project file from ${file.path} to ${expectedFilePath}`);
                             try {
-                                // Ensure parent folder exists before renaming task file
+                                // Ensure parent folder exists before renaming project file
                                 const parentFolder = expectedFilePath.substring(0, expectedFilePath.lastIndexOf('/'));
                                 if (!vault.getAbstractFileByPath(parentFolder)) {
                                     await vault.createFolder(parentFolder);
                                 }
-                                await this.app.fileManager.renameFile(taskFile, expectedFilePath);
-                                this.taskFileCache.set(taskIdStr, expectedFilePath); // Update cache
-                                taskFile = vault.getAbstractFileByPath(expectedFilePath) as TFile; // Get new ref
+                                await this.app.fileManager.renameFile(file, expectedFilePath);
+                                this.projectFileCache.set(projectIdStr, expectedFilePath); // Update cache
+                                file = vault.getAbstractFileByPath(expectedFilePath) as TFile; // Get new ref
                             } catch (renameError) {
-                                console.error(`[Obsidian Sync] Failed to rename task file ${taskFile.path}:`, renameError);
-                                return; // Skip update if rename fails
+                                console.error(`[Obsidian Sync] Failed to rename project file ${file.path}:`, renameError);
+                                // Continue with update at old path? Or skip? Let's skip update if rename fails.
+                                continue;
                             }
                         }
-                        // Update existing file (only if not completed/deleted)
-                        await this.updateObsidianTask(task, taskFile);
-
-                    } else { // Create new task file (only if not completed/deleted)
-                        console.log(`[Obsidian Sync] Creating task file: ${expectedFilePath}`);
+                        // Only update if it's a full sync OR this project was in the delta
+                        if (isFullSync || projectIdsInDelta.has(projectIdStr)) {
+                            await this.updateObsidianProjectFile(project, file);
+                        } else {
+                             // console.log(`[Obsidian Sync] Skipping file update for project ${projectIdStr} (not in delta)`);
+                        }
+                    } else { // Create new file (always needs content)
+                        console.log(`[Obsidian Sync] Creating project file: ${expectedFilePath}`);
                         try {
-                            // Ensure parent folder exists before creating task file
-                            const parentFolder = expectedFilePath.substring(0, expectedFilePath.lastIndexOf('/'));
-                            if (!vault.getAbstractFileByPath(parentFolder)) {
-                                await vault.createFolder(parentFolder);
-                            }
                             const newFile = await vault.create(expectedFilePath, "");
-                            await this.updateObsidianTask(task, newFile);
-                            this.taskFileCache.set(taskIdStr, newFile.path); // Add to cache
+                            await this.updateObsidianProjectFile(project, newFile);
+                            this.projectFileCache.set(projectIdStr, newFile.path); // Add to cache
                         } catch (createError) {
-                            console.error(`[Obsidian Sync] Failed to create task file ${expectedFilePath}:`, createError);
+                            console.error(`[Obsidian Sync] Failed to create project file ${expectedFilePath}:`, createError);
                         }
                     }
 
-                } catch (taskError) {
-                    console.error(`[Obsidian Sync] Error processing task ID ${task.id}:`, taskError);
+                } catch (error) {
+                    console.error(`[Obsidian Sync] Error processing project ${project.name} (ID: ${project.id}):`, error);
+                    syncErrorOccurred = true; // Set error flag
                 }
-            });
-            await Promise.allSettled(taskProcessingPromises);
+            }
+            // Update lookupProjectsApi if cache was modified (important for subsequent section processing)
+            lookupProjectsApi = this.cachedProjects;
+
+
+            // --- Process Sections (Files and Folders) ---
+            console.log("[Obsidian Sync] Processing Sections...");
+            const finalSectionPaths = new Map<string, string>();
+            // Use a copy for iteration
+            const sectionsToIterate = [...lookupSectionsApi];
+            for (const section of sectionsToIterate) { // Iterate over a copy
+                 try {
+                    const sectionIdStr = String(section.id);
+                    const projectIdStr = String(section.project_id);
+                    const existingFilePath = this.sectionFileCache.get(sectionIdStr);
+                    let file: TFile | null = null;
+                    let itemFolder: TFolder | null = null; // Use TFolder | null
+
+                    if (existingFilePath) {
+                        const abstractFile = vault.getAbstractFileByPath(existingFilePath);
+                        if (abstractFile instanceof TFile) {
+                            file = abstractFile;
+                             if (file.parent instanceof TFolder) {
+                               itemFolder = file.parent;
+                            }
+                        } else {
+                            console.warn(`[Cache] Stale section cache: File not found at ${existingFilePath} for ID ${sectionIdStr}. Removing.`);
+                            this.sectionFileCache.delete(sectionIdStr);
+                        }
+                    }
+
+                    let handled = false; // Flag
+
+                    // --- Handle Deleted Sections First ---
+                    if (section.is_deleted && (isFullSync || sectionIdsInDelta.has(sectionIdStr))) {
+                        console.log(`[Obsidian Sync] Section ${sectionIdStr} marked as deleted by API.`);
+                        // ... move folder/file to trash ...
+                        await this.handleMove(itemFolder, file, trashFolderPath, 'section', true); // Pass checkName=true
+                        this.sectionFileCache.delete(sectionIdStr);
+                        // Remove from API cache
+                        this.cachedSections = this.cachedSections.filter(s => s.id !== sectionIdStr);
+                        handled = true;
+                    }
+                    // --- Handle Archived Sections ---
+                    else if (section.is_archived && (isFullSync || sectionIdsInDelta.has(sectionIdStr))) {
+                         console.log(`[Obsidian Sync] Section ${sectionIdStr} marked as archived by API.`);
+                         // ... move folder/file to archive ...
+                         await this.handleMove(itemFolder, file, archiveFolderPath, 'section', true); // Pass checkName=true
+                         this.sectionFileCache.delete(sectionIdStr);
+                         // Remove from API cache
+                         this.cachedSections = this.cachedSections.filter(s => s.id !== sectionIdStr);
+                         handled = true;
+                    }
+
+                    // If handled, skip normal processing
+                    if (handled) {
+                        finalSectionPaths.delete(sectionIdStr); // Ensure not used by tasks
+                        continue;
+                    }
+                    // --- End Handle Deleted/Archived Sections ---
+
+
+                    // --- Proceed with Normal Create/Update/Rename ---
+                    const parentProjectPath = finalProjectPaths.get(projectIdStr); // Get final path of parent project
+
+                    if (!parentProjectPath) {
+                        console.warn(`[Obsidian Sync] Skipping section ${section.name} (ID: ${sectionIdStr}): Parent project folder path not found.`);
+                        continue;
+                    }
+
+                    const sanitizedName = section.name.toString().replace(/[<>:"/\\|?*]/g, '_');
+                    const expectedFolderPath = normalizePath(`${parentProjectPath}/${sanitizedName}`);
+                    const expectedFilePath = normalizePath(`${expectedFolderPath}/${sanitizedName}.md`); // Section file path
+
+                    let currentFolderPath = expectedFolderPath;
+                    const folderAtExpectedPath = vault.getAbstractFileByPath(expectedFolderPath);
+                    const existingFolderPath = itemFolder?.path;
+
+                    // 2. Ensure Folder Exists / Handle Rename (Similar to projects)
+                    if (itemFolder && existingFolderPath && existingFolderPath !== expectedFolderPath) {
+                        const folderAtOldPath = vault.getAbstractFileByPath(existingFolderPath);
+                        if (folderAtOldPath instanceof TFolder) {
+                            if (!folderAtExpectedPath) {
+                                console.log(`[Obsidian Sync] Renaming section folder from ${existingFolderPath} to ${expectedFolderPath}`);
+                                await this.app.fileManager.renameFile(itemFolder, expectedFolderPath);
+                                currentFolderPath = expectedFolderPath;
+                                 // TODO: Update paths in task cache? Defer.
+                            } else {
+                                console.warn(`[Obsidian Sync] Cannot rename section folder ${existingFolderPath} to ${expectedFolderPath}, target exists. Using target.`);
+                                currentFolderPath = expectedFolderPath;
+                                // TODO: Merge/move files? Defer.
+                            }
+                        } else {
+                             console.warn(`[Obsidian Sync] Old section folder ${existingFolderPath} not found for rename. Assuming ${expectedFolderPath}.`);
+                             currentFolderPath = expectedFolderPath;
+                             if (!(folderAtExpectedPath instanceof TFolder)) {
+                                 console.log(`[Obsidian Sync] Creating section folder ${currentFolderPath}`);
+                                 await vault.createFolder(currentFolderPath);
+                             }
+                        }
+                    } else if (!(folderAtExpectedPath instanceof TFolder)) {
+                        console.log(`[Obsidian Sync] Creating section folder ${currentFolderPath}`);
+                        await vault.createFolder(currentFolderPath);
+                    }
+                    finalSectionPaths.set(sectionIdStr, currentFolderPath); // Store final folder path
+
+                    // 3. Process Section .md File (Conditional Update)
+                    if (file) { // Found via cache
+                        if (file.path !== expectedFilePath) {
+                             console.log(`[Obsidian Sync] Renaming section file from ${file.path} to ${expectedFilePath}`);
+                             try {
+                                 // Ensure parent folder exists before renaming section file
+                                 const parentFolder = expectedFilePath.substring(0, expectedFilePath.lastIndexOf('/'));
+                                 if (!vault.getAbstractFileByPath(parentFolder)) {
+                                     await vault.createFolder(parentFolder);
+                                 }
+                                 await this.app.fileManager.renameFile(file, expectedFilePath);
+                                 this.sectionFileCache.set(sectionIdStr, expectedFilePath);
+                                 file = vault.getAbstractFileByPath(expectedFilePath) as TFile;
+                             } catch (renameError) { /* ... error handling ... */ return; }
+                        }
+                        // Only update if it's a full sync OR this section was in the delta
+                        if (isFullSync || sectionIdsInDelta.has(sectionIdStr)) {
+                            await this.updateObsidianSectionFile(section, file);
+                        } else {
+                             // console.log(`[Obsidian Sync] Skipping file update for section ${sectionIdStr} (not in delta)`);
+                        }
+                    } else { // Create new file (always needs content)
+                        console.log(`[Obsidian Sync] Creating section file: ${expectedFilePath}`);
+                        try {
+                            const newFile = await vault.create(expectedFilePath, "");
+                            await this.updateObsidianSectionFile(section, newFile);
+                            this.sectionFileCache.set(sectionIdStr, newFile.path);
+                        } catch (createError) { /* ... error handling ... */ }
+                    }
+
+                } catch (error) {
+                    console.error(`[Obsidian Sync] Error processing section ${section.name} (ID: ${section.id}):`, error);
+                    syncErrorOccurred = true; // Set error flag
+                }
+            }
+             // Update lookupSectionsApi if cache was modified
+            lookupSectionsApi = this.cachedSections;
+
+
+            // --- Process Tasks ---
+            console.log("[Obsidian Sync] Processing Tasks...");
+            if (!tasksToProcess || tasksToProcess.length === 0) { /* ... log no tasks ... */ }
+            else {
+                const taskProcessingPromises = tasksToProcess.map(async (task) => {
+                    try {
+                        const taskIdStr = String(task.id);
+                        const existingFilePath = this.taskFileCache.get(taskIdStr);
+                        let taskFile: TFile | null = null;
+
+                        // --- Handle Deleted Tasks First ---
+                        if (task.is_deleted) {
+                            console.log(`[Obsidian Sync] Task ${taskIdStr} marked as deleted by API.`);
+                            if (existingFilePath) {
+                                const file = this.app.vault.getAbstractFileByPath(existingFilePath);
+                                if (file instanceof TFile) {
+                                    try {
+                                        // 1. Update frontmatter to mark as deleted
+                                        console.log(`[Obsidian Sync] Updating frontmatter for deleted task ${taskIdStr} before moving.`);
+                                        await this.app.fileManager.processFrontMatter(file, (fm) => {
+                                            fm['is_deleted'] = true; // Add/update the deleted flag
+                                            // Optionally add a timestamp
+                                            // fm['deleted_at'] = new Date().toISOString();
+                                            // Ensure other fields are NOT overwritten by minimal task data
+                                        });
+
+                                        // 2. Move the updated file to Trash folder
+                                        await this.moveFileToCustomLocation(file, trashFolderPath, 'deleted task file');
+
+                                    } catch (deleteProcessError) {
+                                         console.error(`[Obsidian Sync] Error processing deletion (update/move) for task ${taskIdStr} at ${existingFilePath}:`, deleteProcessError);
+                                         // Decide if we should still remove from cache even if move failed
+                                    }
+                                } else {
+                                    console.warn(`[Obsidian Sync] File for deleted task ${taskIdStr} not found at cached path ${existingFilePath}.`);
+                                }
+                                // 3. Remove from cache after handling deletion attempt
+                                this.taskFileCache.delete(taskIdStr);
+                            } else {
+                                console.log(`[Obsidian Sync] Deleted task ${taskIdStr} not found in cache. No file action needed.`);
+                            }
+                            return; // Stop processing this task further
+                        }
+                        // --- End Handle Deleted Tasks ---
+
+                        // --- Find Existing File (needed for both completed and active tasks) ---
+                        if (existingFilePath) {
+                            const file = vault.getAbstractFileByPath(existingFilePath);
+                            if (file instanceof TFile) {
+                                taskFile = file;
+                            } else {
+                                console.warn(`[Cache] Stale task cache: File not found at ${existingFilePath} for ID ${taskIdStr}. Removing.`);
+                                this.taskFileCache.delete(taskIdStr);
+                                // taskFile remains null
+                            }
+                        }
+
+                        // --- Handle Completed Tasks ---
+                        if (task.completed_at) {
+                            console.log(`[Obsidian Sync] Task ${taskIdStr} marked as completed by API.`);
+                            if (taskFile) { // Check if we found the file
+                                console.log(`[Obsidian Sync] Updating frontmatter for completed task ${taskIdStr} before moving.`);
+                                // 1. Update frontmatter first
+                                await this.updateObsidianTask(task, taskFile);
+
+                                console.log(`[Obsidian Sync] Moving completed task ${taskIdStr} to Done folder.`);
+                                // 2. Move the updated file to Done folder
+                                await this.moveFileToCustomLocation(taskFile, doneFolderPath, 'completed task file');
+
+                                // 3. Remove from cache after successful update and move attempt
+                                this.taskFileCache.delete(taskIdStr);
+
+                            } else {
+                                console.log(`[Obsidian Sync] Completed task ${taskIdStr} has no corresponding file in vault/cache. No file action needed.`);
+                                // Remove from cache if it somehow existed but file didn't
+                                if (existingFilePath) this.taskFileCache.delete(taskIdStr);
+                            }
+                            return; // Stop processing this task further (don't attempt regular update/rename)
+                        }
+                        // --- End Handle Completed Tasks ---
+
+
+                        // --- Proceed with Normal Create/Update/Rename for non-deleted, non-completed tasks ---
+
+                        // 2. Calculate expected path (moved this down, only needed for active tasks)
+                        const sanitizedContent = (task.content || `Untitled Task ${taskIdStr}`).replace(/[<>:"/\\|?*]/g, '_').substring(0, 100);
+                        let parentFolderPath: string | undefined;
+                        if (task.section_id) {
+                            parentFolderPath = finalSectionPaths.get(String(task.section_id));
+                        }
+                        if (!parentFolderPath && task.project_id) {
+                            parentFolderPath = finalProjectPaths.get(String(task.project_id));
+                        }
+                        // Fallback to base folder if no parent project/section path found (should be rare)
+                        if (!parentFolderPath) {
+                            console.warn(`[Obsidian Sync] Task ${taskIdStr} has no parent project/section path. Using base folder.`);
+                            parentFolderPath = baseFolderPath;
+                        }
+                        const expectedFilePath = normalizePath(`${parentFolderPath}/${sanitizedContent}.md`);
+
+
+                        // 3. Process Task .md File (Rename/Update/Create) - Only if NOT completed
+                        if (taskFile) { // Found via cache and not completed
+                            if (taskFile.path !== expectedFilePath) {
+                                console.log(`[Obsidian Sync] Renaming task file from ${taskFile.path} to ${expectedFilePath}`);
+                                try {
+                                    // Ensure parent folder exists before renaming task file
+                                    const parentFolder = expectedFilePath.substring(0, expectedFilePath.lastIndexOf('/'));
+                                    if (!vault.getAbstractFileByPath(parentFolder)) {
+                                        await vault.createFolder(parentFolder);
+                                    }
+                                    await this.app.fileManager.renameFile(taskFile, expectedFilePath);
+                                    this.taskFileCache.set(taskIdStr, expectedFilePath); // Update cache
+                                    taskFile = vault.getAbstractFileByPath(expectedFilePath) as TFile; // Get new ref
+                                } catch (renameError) {
+                                    console.error(`[Obsidian Sync] Failed to rename task file ${taskFile.path}:`, renameError);
+                                    return; // Skip update if rename fails
+                                }
+                            }
+                            // Update existing file (only if not completed/deleted)
+                            await this.updateObsidianTask(task, taskFile);
+
+                        } else { // Create new task file (only if not completed/deleted)
+                            console.log(`[Obsidian Sync] Creating task file: ${expectedFilePath}`);
+                            try {
+                                // Ensure parent folder exists before creating task file
+                                const parentFolder = expectedFilePath.substring(0, expectedFilePath.lastIndexOf('/'));
+                                if (!vault.getAbstractFileByPath(parentFolder)) {
+                                    await vault.createFolder(parentFolder);
+                                }
+                                const newFile = await vault.create(expectedFilePath, "");
+                                await this.updateObsidianTask(task, newFile);
+                                this.taskFileCache.set(taskIdStr, newFile.path); // Add to cache
+                            } catch (createError) {
+                                console.error(`[Obsidian Sync] Failed to create task file ${expectedFilePath}:`, createError);
+                            }
+                        }
+
+                    } catch (taskError) {
+                        console.error(`[Obsidian Sync] Error processing task ID ${task.id}:`, taskError);
+                        syncErrorOccurred = true; // Set error flag
+                    }
+                });
+                await Promise.allSettled(taskProcessingPromises);
+            }
+            // --- End Task Processing ---
+
+
+            // --- Handle Deletions (Full Sync Only - Keep for robustness) ---
+            // This can remain as a fallback for items missed by incremental deletion markers
+            if (isFullSync) {
+                console.log("[Obsidian Sync] Performing full sync cleanup (checking for items missed by incremental deletes)...");
+                const fetchedProjectIds = new Set(lookupProjectsApi.map(p => p.id));
+                const fetchedSectionIds = new Set(lookupSectionsApi.map(s => s.id));
+                const fetchedTaskIds = new Set(this.cachedTasks.map(t => t.id));
+
+                // Clean up projects (Trashing is likely appropriate here)
+                for (const [projectId, filePath] of this.projectFileCache.entries()) {
+                    if (!fetchedProjectIds.has(projectId)) {
+                        console.log(`[Obsidian Sync] Project ID ${projectId} not found in full sync data. Trashing file and potentially folder: ${filePath}`);
+                        // Use a modified trash function or handle folder deletion carefully
+                        await this.trashOrArchiveFileById(projectId, 'project', filePath);
+                    }
+                }
+
+                // Clean up sections (Trashing is likely appropriate here)
+                for (const [sectionId, filePath] of this.sectionFileCache.entries()) {
+                    if (!fetchedSectionIds.has(sectionId)) {
+                        console.log(`[Obsidian Sync] Section ID ${sectionId} not found in full sync data. Trashing file and potentially folder: ${filePath}`);
+                        await this.trashOrArchiveFileById(sectionId, 'section', filePath);
+                    }
+                }
+
+                // Clean up tasks (Distinguish between completed and deleted)
+                for (const [taskId, filePath] of this.taskFileCache.entries()) {
+                    // Check if task still exists in cache (might have been removed by is_deleted handler)
+                    if (this.taskFileCache.has(taskId) && !fetchedTaskIds.has(taskId)) {
+                        console.log(`[Obsidian Sync] Task ID ${taskId} not found in full sync data. Checking completion status for file: ${filePath}`);
+                        await this.trashOrArchiveFileById(taskId, 'task', filePath); // This handles completion check
+                    }
+                }
+                console.log("[Obsidian Sync] Deletion/Completion cleanup finished.");
+            }
+            // --- End Deletion Handling ---
+
+
+            console.log(`[Obsidian Sync] Todoist ${syncType} sync processing completed.`);
+            new Notice(`Todoist ${syncType} sync finished.`);
+
+        } catch (mainSyncError) {
+            console.error(`[Obsidian Sync] Uncaught error during ${syncType} sync:`, mainSyncError);
+            new Notice(`Todoist ${syncType} sync failed. Check console.`);
+            syncErrorOccurred = true; // Set error flag
+        } finally {
+            // Update Status Bar - End
+            if (this.statusBarItemEl) {
+                if (syncErrorOccurred) {
+                    this.statusBarItemEl.setText('Todoist Sync: Error');
+                } else {
+                    const now = new Date();
+                    this.statusBarItemEl.setText(`Todoist Synced: ${now.toLocaleTimeString()}`);
+                }
+                this.statusBarItemEl.removeClass('syncing'); // Remove optional styling class
+            }
         }
-        // --- End Task Processing ---
-
-
-        // --- Handle Deletions (Full Sync Only - Keep for robustness) ---
-        // This can remain as a fallback for items missed by incremental deletion markers
-        if (isFullSync) {
-            console.log("[Obsidian Sync] Performing full sync cleanup (checking for items missed by incremental deletes)...");
-            const fetchedProjectIds = new Set(lookupProjectsApi.map(p => p.id));
-            const fetchedSectionIds = new Set(lookupSectionsApi.map(s => s.id));
-            const fetchedTaskIds = new Set(tasksToProcess.map(t => t.id));
-
-            // Clean up projects (Trashing is likely appropriate here)
-            for (const [projectId, filePath] of this.projectFileCache.entries()) {
-                if (!fetchedProjectIds.has(projectId)) {
-                    console.log(`[Obsidian Sync] Project ID ${projectId} not found in full sync data. Trashing file and potentially folder: ${filePath}`);
-                    // Use a modified trash function or handle folder deletion carefully
-                    await this.trashOrArchiveFileById(projectId, 'project', filePath);
-                }
-            }
-
-            // Clean up sections (Trashing is likely appropriate here)
-            for (const [sectionId, filePath] of this.sectionFileCache.entries()) {
-                if (!fetchedSectionIds.has(sectionId)) {
-                    console.log(`[Obsidian Sync] Section ID ${sectionId} not found in full sync data. Trashing file and potentially folder: ${filePath}`);
-                    await this.trashOrArchiveFileById(sectionId, 'section', filePath);
-                }
-            }
-
-            // Clean up tasks (Distinguish between completed and deleted)
-            for (const [taskId, filePath] of this.taskFileCache.entries()) {
-                // Check if task still exists in cache (might have been removed by is_deleted handler)
-                if (this.taskFileCache.has(taskId) && !fetchedTaskIds.has(taskId)) {
-                    console.log(`[Obsidian Sync] Task ID ${taskId} not found in full sync data. Checking completion status for file: ${filePath}`);
-                    await this.trashOrArchiveFileById(taskId, 'task', filePath); // This handles completion check
-                }
-            }
-            console.log("[Obsidian Sync] Deletion/Completion cleanup finished.");
-        }
-        // --- End Deletion Handling ---
-
-
-        console.log(`[Obsidian Sync] Todoist ${syncType} sync processing completed.`);
-        new Notice(`Todoist ${syncType} sync finished.`);
     }
 
     // Renamed and modified helper function for full sync cleanup
@@ -956,22 +1190,31 @@ export default class TodoistSyncPlugin extends Plugin {
 
     // Helper function to move a single FILE to custom location (Trash or Archive)
     async moveFileToCustomLocation(fileToMove: TFile, targetParentPath: string, itemTypeDescription: string) {
-        let targetPath = normalizePath(`${targetParentPath}/${fileToMove.name}`);
-        let conflictIndex = 0;
-        // Handle potential name conflicts for the file
-        while (this.app.vault.getAbstractFileByPath(targetPath)) {
-            conflictIndex++;
-            const nameWithoutExt = fileToMove.basename;
-            targetPath = normalizePath(`${targetParentPath}/${nameWithoutExt}_${conflictIndex}.${fileToMove.extension}`);
-        }
-        console.log(`[Obsidian Sync] Moving ${itemTypeDescription} ${fileToMove.path} to ${targetPath}`);
         try {
+            // Ensure target parent folder exists
+            if (!this.app.vault.getAbstractFileByPath(targetParentPath)) {
+                console.log(`[Obsidian Sync] Creating target folder for move: ${targetParentPath}`);
+                await this.app.vault.createFolder(targetParentPath);
+            }
+
+            let targetPath = normalizePath(`${targetParentPath}/${fileToMove.name}`);
+            let conflictIndex = 0;
+            // Handle potential name conflicts for the file
+            while (this.app.vault.getAbstractFileByPath(targetPath)) {
+                conflictIndex++;
+                const nameWithoutExt = fileToMove.basename;
+                targetPath = normalizePath(`${targetParentPath}/${nameWithoutExt}_${conflictIndex}.${fileToMove.extension}`);
+            }
+            console.log(`[Obsidian Sync] Moving ${itemTypeDescription} ${fileToMove.path} to ${targetPath}`);
+
             await this.app.fileManager.renameFile(fileToMove, targetPath);
+
         } catch (moveError) {
-            console.error(`[Obsidian Sync] Failed to move ${itemTypeDescription} ${fileToMove.path} to ${targetPath}:`, moveError);
+            console.error(`[Obsidian Sync] Failed to move ${itemTypeDescription} ${fileToMove.path} to ${targetParentPath}:`, moveError);
             // Fallback? Maybe try Obsidian trash?
             // console.log(`[Obsidian Sync] Fallback: Trashing ${itemTypeDescription} ${fileToMove.path}`);
             // await this.app.vault.trash(fileToMove, false);
+            throw moveError; // Re-throw error so Promise.allSettled sees it failed
         }
     }
 
