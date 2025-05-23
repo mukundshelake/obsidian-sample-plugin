@@ -12,29 +12,33 @@ export async function moveFileToCustomLocation(
     fileToMove: TFile,
     targetParentPath: string,
     itemTypeDescription: string
-) {
+): Promise<string | null> { // <<< CHANGED RETURN TYPE
     try {
         // Ensure target parent folder exists
-        if (!app.vault.getAbstractFileByPath(targetParentPath)) {
-            console.log(`[Obsidian Sync] Creating target folder for move: ${targetParentPath}`);
-            await app.vault.createFolder(targetParentPath);
+        const normalizedTargetParentPath = normalizePath(targetParentPath); // Normalize once
+        if (!app.vault.getAbstractFileByPath(normalizedTargetParentPath)) {
+            console.log(`[Obsidian Sync] Creating target folder for move: ${normalizedTargetParentPath}`);
+            await app.vault.createFolder(normalizedTargetParentPath);
         }
 
-        let targetPath = normalizePath(`${targetParentPath}/${fileToMove.name}`);
+        let targetPath = normalizePath(`${normalizedTargetParentPath}/${fileToMove.name}`);
         let conflictIndex = 0;
         // Handle potential name conflicts for the file
         while (app.vault.getAbstractFileByPath(targetPath)) {
             conflictIndex++;
             const nameWithoutExt = fileToMove.basename;
-            targetPath = normalizePath(`${targetParentPath}/${nameWithoutExt}_${conflictIndex}.${fileToMove.extension}`);
+            targetPath = normalizePath(`${normalizedTargetParentPath}/${nameWithoutExt}_${conflictIndex}.${fileToMove.extension}`);
         }
         console.log(`[Obsidian Sync] Moving ${itemTypeDescription} ${fileToMove.path} to ${targetPath}`);
 
         await app.fileManager.renameFile(fileToMove, targetPath);
+        return targetPath; // <<< RETURN THE NEW PATH
 
     } catch (moveError) {
         console.error(`[Obsidian Sync] Failed to move ${itemTypeDescription} ${fileToMove.path} to ${targetParentPath}:`, moveError);
-        throw moveError; // Re-throw error
+        // Do not re-throw here if you want commandManager to handle null gracefully
+        // throw moveError; 
+        return null; // <<< RETURN NULL ON FAILURE
     }
 }
 

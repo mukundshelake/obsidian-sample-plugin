@@ -39,13 +39,14 @@ export interface Item { // Add export - Todoist calls tasks "items" in the Sync 
     id: string;
     content: string;
     description: string;
-    project_id: string;
+    project_id: string; // Assuming project_id is always present for a task, adjust if it can be null
     section_id?: string | null; // Sections can be null
     priority: number;
     due?: Due | null; // Make sure Due interface is updated
     labels: string[];
     url: string;
     parent_id?: string | null; // Parent ID can be null
+    is_completed: boolean; // <<< ADDED THIS FIELD
     completed_at?: string | null; // Completion timestamp can be null
     created_at: string; // <-- Add created_at property
     is_deleted: boolean; // Add is_deleted based on sync data structure
@@ -93,6 +94,23 @@ export interface TodoistCommand { // Add export
 
 export interface ItemCompleteArgs { // Add export
     id: string;
+    completed_at?: string; // Ensure completed_at is part of this if CommandManager sends it
+}
+
+// Define ItemArgs for item_update commands
+export interface ItemArgs {
+    id: string;
+    content?: string;
+    description?: string;
+    priority?: number;
+    due_string?: string; // For sending due date changes as string
+    due_date?: string;   // For specific date "YYYY-MM-DD"
+    due_datetime?: string; // For specific datetime "YYYY-MM-DDTHH:MM:SS"
+    due_lang?: string;   // Language for due_string, e.g., "en"
+    labels?: string[];   // For updating labels
+    project_id?: string; // For moving task to a different project
+    section_id?: string; // For moving task to a different section (also implies project)
+    // Add any other fields you intend to update from Obsidian to Todoist
 }
 
 // --- Sync API Response Interfaces ---
@@ -324,7 +342,7 @@ export async function postTodoistCommands(
     app: App,
     apiKey: string,
     commands: TodoistCommand[]
-): Promise<{ success: boolean; syncStatus?: SyncCommandResponse['sync_status']; error?: any }> {
+): Promise<{ success: boolean; syncStatus?: SyncCommandResponse['sync_status']; tempIdMapping?: SyncCommandResponse['temp_id_mapping']; error?: any }> { // Added tempIdMapping to return type
 
     if (!apiKey) {
         console.error("[Todoist Sync] API Key is missing for posting commands.");
@@ -392,16 +410,16 @@ export async function postTodoistCommands(
             for (const uuid in data.sync_status) {
                 if (data.sync_status[uuid] !== "ok") {
                     allOk = false;
-                    const errorInfo = data.sync_status[uuid] as { error_code: number; error: string }; // Type assertion
+                    const errorInfo = data.sync_status[uuid] as { error_code: number; error: string };
                     console.error(`[Todoist Sync] Command ${uuid} failed:`, errorInfo.error_code, errorInfo.error);
-                    new Notice(`Todoist command failed: ${errorInfo.error}`);
+                    new Notice(`Todoist command failed for ${uuid}: ${errorInfo.error}`); // Be more specific
                 } else {
                     console.log(`[Todoist Sync] Command ${uuid} successful.`);
                 }
             }
         }
 
-        return { success: allOk, syncStatus: data.sync_status };
+        return { success: allOk, syncStatus: data.sync_status, tempIdMapping: data.temp_id_mapping }; // <<< ADDED tempIdMapping
 
     } catch (error) {
         console.error("[Todoist Sync] Network or parsing error during postTodoistCommands:", error);

@@ -14,7 +14,7 @@ import { updateObsidianProjectFile, updateObsidianSectionFile, updateObsidianTas
 // Import sync engine function and type
 import { syncOrFullSyncTasks, SyncCaches } from "./src/sync/syncEngine"; // <-- Add SyncCaches here
 import { CommandManager } from "./src/sync/commandManager"; // <-- Import CommandManager
-import { handleMetadataChange } from "./src/sync/eventHandlers"; // <-- Import event handler
+import { setupEventHandlers } from "./src/sync/eventHandlers"; // <<< ADD THIS IMPORT
 
 export default class TodoistSyncPlugin extends Plugin {
     settings: TodoistSyncSettings;
@@ -46,6 +46,9 @@ export default class TodoistSyncPlugin extends Plugin {
         // Add Status Bar Item - this returns HTMLElement
         this.statusBarItemEl = this.addStatusBarItem();
         this.updateStatusBar('Todoist Sync: Ready', 'idle'); // Initial state
+
+        // --- Setup Event Handlers ---
+        setupEventHandlers(this); // <<< CALL THE NEW SETUP FUNCTION HERE
 
         // --- Add Commands ---
         this.addCommand({
@@ -127,15 +130,6 @@ export default class TodoistSyncPlugin extends Plugin {
                 }
             },
         });
-
-        // --- Register Metadata Cache Change Listener ---
-        this.registerEvent(
-            // Use the imported CachedMetadata type directly
-            this.app.metadataCache.on('changed', (file: TFile, data: string, cache: CachedMetadata) =>
-                // Call the imported handler function, passing the plugin instance ('this')
-                handleMetadataChange(this, file, data, cache)
-            )
-        );
 
         // --- Register Vault Change Listeners (for future use, e.g., delete/rename) ---
         // this.registerEvent(this.app.vault.on('delete', this.handleVaultDelete.bind(this)));
