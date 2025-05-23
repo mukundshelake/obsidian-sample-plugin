@@ -331,6 +331,76 @@ export async function syncOrFullSyncTasks(
                 }
                 // --- End Deletion/Archiving Handling ---
 
+                // --- Detect and handle project rename ---
+                if (cachedProjectPath) {
+                    // Get the old folder and file paths from the cache
+                    const oldFile = vault.getAbstractFileByPath(cachedProjectPath);
+                    let oldFolderPath: string | null = null;
+                    let oldFilePath: string | null = null;
+
+                    if (oldFile instanceof TFile) {
+                        oldFilePath = oldFile.path;
+                        oldFolderPath = oldFile.parent ? oldFile.parent.path : null;
+                    } else if (oldFile instanceof TFolder) {
+                        oldFolderPath = oldFile.path;
+                        // Try to find the .md file inside
+                        const possibleMd = vault.getAbstractFileByPath(`${oldFolderPath}/${oldFile.name}.md`);
+                        if (possibleMd instanceof TFile) oldFilePath = possibleMd.path;
+                    }
+
+                    // If the folder path does not match the expected (renamed in Todoist)
+                    if (oldFolderPath && oldFolderPath !== expectedProjectFolderPath) {
+                        console.log(`[Obsidian Sync] Detected project rename for ID ${projectIdStr}: '${oldFolderPath}' -> '${expectedProjectFolderPath}'`);
+                        // 1. Rename the folder
+                        await plugin.app.fileManager.renameFile(
+                            vault.getAbstractFileByPath(oldFolderPath) as TFolder,
+                            expectedProjectFolderPath
+                        );
+
+                        // 2. Rename the .md file if needed
+                        if (oldFilePath) {
+                            const oldMdName = oldFilePath.split('/').pop();
+                            const newMdName = `${sanitizedProjectName}.md`;
+                            if (oldMdName !== newMdName) {
+                                await plugin.app.fileManager.renameFile(
+                                    vault.getAbstractFileByPath(`${expectedProjectFolderPath}/${oldMdName}`) as TFile,
+                                    `${expectedProjectFolderPath}/${newMdName}`
+                                );
+                            }
+                        }
+
+                        // 3. Update the cache
+                        caches.projectFileCache.set(projectIdStr, `${expectedProjectFolderPath}/${sanitizedProjectName}.md`);
+
+                        // 4. Update the frontmatter in the .md file
+                        const projectMdFile = vault.getAbstractFileByPath(`${expectedProjectFolderPath}/${sanitizedProjectName}.md`);
+                        if (projectMdFile instanceof TFile) {
+                            await plugin.app.fileManager.processFrontMatter(projectMdFile, (fm) => {
+                                fm.name = project.name;
+                            });
+                        }
+
+                        // --- Update sectionFileCache and taskFileCache paths if they start with oldFolderPath ---
+                        if (oldFolderPath && oldFolderPath !== expectedProjectFolderPath) {
+                            // Update sectionFileCache
+                            for (const [sectionId, sectionPath] of caches.sectionFileCache.entries()) {
+                                if (sectionPath && sectionPath.startsWith(oldFolderPath + "/")) {
+                                    const newSectionPath = sectionPath.replace(oldFolderPath, expectedProjectFolderPath);
+                                    caches.sectionFileCache.set(sectionId, newSectionPath);
+                                    console.log(`[Cache Debug] Updated sectionFileCache for ${sectionId}: ${sectionPath} -> ${newSectionPath}`);
+                                }
+                            }
+                            // Update taskFileCache
+                            for (const [taskId, taskPath] of caches.taskFileCache.entries()) {
+                                if (taskPath && taskPath.startsWith(oldFolderPath + "/")) {
+                                    const newTaskPath = taskPath.replace(oldFolderPath, expectedProjectFolderPath);
+                                    caches.taskFileCache.set(taskId, newTaskPath);
+                                    console.log(`[Cache Debug] Updated taskFileCache for ${taskId}: ${taskPath} -> ${newTaskPath}`);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // --- Process Active Projects (Create/Update/Rename) ---
                 // Get folder reference first
@@ -452,7 +522,7 @@ export async function syncOrFullSyncTasks(
                         if (itemByCache instanceof TFile) {
                             // Cache points to the index file, parent is the section folder
                             fileToDelete = itemByCache;
-                            if (itemByCache.parent instanceof TFolder) { // Ensure parent is a folder
+                            if (itemByCache.parent instanceof TFolder) {
                                 folderToDelete = itemByCache.parent;
                                 console.log(`[Cache Debug] Section ${sectionIdStr} (Delete Check): Found file via cache (${fileToDelete.path}), parent folder is ${folderToDelete.path}`);
                             } else {
@@ -506,8 +576,7 @@ export async function syncOrFullSyncTasks(
                         console.log(`[Cache Debug] Section ${sectionIdStr}: Deleting from sectionFileCache (not found locally - delete).`);
                         caches.sectionFileCache.delete(sectionIdStr); // Ensure removed if somehow present
                     }
-                    continue; // Skip further processing for this deleted section
-
+                    continue;
                 } else if (section.is_archived && (isFullSync || sectionIdsInDelta.has(sectionIdStr))) {
                     // --- Similar logic for archiving, using cache first ---
                     console.log(`[Obsidian Sync] Section ${sectionIdStr} (${section.name}) marked archived.`);
@@ -569,93 +638,122 @@ export async function syncOrFullSyncTasks(
                         console.log(`[Cache Debug] Section ${sectionIdStr}: Deleting from sectionFileCache (not found locally - archive).`);
                         caches.sectionFileCache.delete(sectionIdStr); // Ensure removed
                     }
-                    continue; // Skip further processing
+                    continue;
                 }
                 // --- End Deletion/Archiving Handling ---
 
-                // --- STEP 2: Process Active Sections - Find Parent Project ---
+                // --- STEP 2: Calculate Paths and Get Local References for Active Section ---
                 console.log(`[Cache Debug] Section ${sectionIdStr}: Reading projectMap to find parent ${section.project_id}`);
-                const parentProject = projectMap.get(String(section.project_id)); // Use project_id ONLY for active sections
-
-                // Skip if parent project doesn't exist or is deleted/archived
+                const parentProject = projectMap.get(String(section.project_id));
                 if (!parentProject || parentProject.is_deleted || parentProject.is_archived) {
-                    console.log(`[Obsidian Sync] Skipping active section ${sectionIdStr} (${section.name}) because parent project ${section.project_id} is missing, deleted, or archived in cache.`);
-                    // Ensure section is removed from cache if its parent is gone (shouldn't happen if delete check is first, but good safety)
-                    if (caches.sectionFileCache.has(sectionIdStr)) {
-                         console.log(`[Cache Debug] Section ${sectionIdStr}: Removing from sectionFileCache because parent project is invalid.`);
-                         caches.sectionFileCache.delete(sectionIdStr);
-                    }
                     continue;
                 }
 
-                // --- STEP 3: Calculate Paths and Get Local References for Active Section ---
                 const sanitizedProjectName = sanitizeName(parentProject.name);
                 const sanitizedSectionName = sanitizeName(section.name);
                 const expectedSectionFolderPath = normalizePath(`${baseFolderPath}/${sanitizedProjectName}/${sanitizedSectionName}`);
                 const expectedSectionFilePath = normalizePath(`${expectedSectionFolderPath}/${sanitizedSectionName}.md`);
 
+                // --- STEP 3: Detect and handle section rename ---
                 const cachedSectionPath = caches.sectionFileCache.get(sectionIdStr);
-                console.log(`[Cache Debug] Section ${sectionIdStr} (Active): Reading sectionFileCache. Path: ${cachedSectionPath}`);
-                let file = cachedSectionPath ? vault.getAbstractFileByPath(cachedSectionPath) : null;
-                if (!file) {
-                    file = vault.getAbstractFileByPath(expectedSectionFilePath); // Check expected path if cache miss
-                }
-                let itemFolder = vault.getAbstractFileByPath(expectedSectionFolderPath); // Check expected folder path
+                let oldSectionFolderPath: string | null = null;
+                let oldSectionFilePath: string | null = null;
 
-                // --- STEP 4: Ensure Folders Exist for Active Section ---
-                const parentProjectFolder = vault.getAbstractFileByPath(normalizePath(`${baseFolderPath}/${sanitizedProjectName}`));
-                 if (!(parentProjectFolder instanceof TFolder)) {
-                     console.warn(`[Obsidian Sync] Parent project folder for active section ${sectionIdStr} not found at ${normalizePath(`${baseFolderPath}/${sanitizedProjectName}`)}. Skipping section.`);
-                     continue; // Should not happen if project loop ran correctly
-                }
-                 if (!(itemFolder instanceof TFolder)) {
-                    console.log(`[Obsidian Sync] Creating section folder: ${expectedSectionFolderPath}`);
-                    await vault.createFolder(expectedSectionFolderPath);
-                    itemFolder = vault.getAbstractFileByPath(expectedSectionFolderPath); // Re-fetch after creation
-                }
-
-                // --- STEP 5: Create/Update/Rename Active Section File ---
-                // Re-fetch file reference based on cache/expected path *after* potential folder creation
-                const currentCachedPath = caches.sectionFileCache.get(sectionIdStr);
-                file = currentCachedPath ? vault.getAbstractFileByPath(currentCachedPath) : null;
-                 if (!file) {
-                    file = vault.getAbstractFileByPath(expectedSectionFilePath);
-                }
-
-                if (file instanceof TFile) {
-                    // Existing file found, check for rename/move and update
-                    let fileToUpdate: TFile = file;
-                    if (file.path !== expectedSectionFilePath) {
-                        console.log(`[Obsidian Sync] Renaming/moving section file ${file.path} to ${expectedSectionFilePath}`);
-                         try {
-                            await plugin.app.fileManager.renameFile(file, expectedSectionFilePath);
-                            const renamedFile = vault.getAbstractFileByPath(expectedSectionFilePath);
-                            if (renamedFile instanceof TFile) { fileToUpdate = renamedFile; }
-                            else { throw new Error("Rename failed"); }
-                        } catch (renameError) { /* ... error handling ... */ throw renameError; }
+                if (cachedSectionPath) {
+                    const oldSectionFile = vault.getAbstractFileByPath(cachedSectionPath);
+                    if (oldSectionFile instanceof TFile) {
+                        oldSectionFilePath = oldSectionFile.path;
+                        oldSectionFolderPath = oldSectionFile.parent ? oldSectionFile.parent.path : null;
+                    } else if (oldSectionFile instanceof TFolder) {
+                        oldSectionFolderPath = oldSectionFile.path;
+                        const possibleMd = vault.getAbstractFileByPath(`${oldSectionFolderPath}/${oldSectionFile.name}.md`);
+                        if (possibleMd instanceof TFile) oldSectionFilePath = possibleMd.path;
                     }
-                    console.log(`[Cache Debug] Section ${sectionIdStr}: Calling updateObsidianSectionFile for ${fileToUpdate.path}`);
-                    await updateObsidianSectionFile(plugin.app, fileToUpdate, section, parentProject);
-                    console.log(`[Cache Debug] Section ${sectionIdStr}: Setting sectionFileCache path to ${fileToUpdate.path}`);
-                    caches.sectionFileCache.set(sectionIdStr, fileToUpdate.path);
 
-                } else if (file instanceof TFolder) {
-                    // Folder exists at the file path? Create index file.
-                     console.warn(`[Obsidian Sync] Expected file but found folder for section ${sectionIdStr} at ${file.path}. Creating index file inside.`);
-                     const newFile = await vault.create(expectedSectionFilePath, `---\n---\n`);
-                     console.log(`[Cache Debug] Section ${sectionIdStr}: Calling updateObsidianSectionFile for new index file ${newFile.path}`);
-                     await updateObsidianSectionFile(plugin.app, newFile, section, parentProject);
-                     console.log(`[Cache Debug] Section ${sectionIdStr}: Setting sectionFileCache path to ${newFile.path} (created index)`);
-                     caches.sectionFileCache.set(sectionIdStr, newFile.path);
+                    if (oldSectionFolderPath && oldSectionFolderPath !== expectedSectionFolderPath) {
+                        console.log(`[Obsidian Sync] Detected section rename for ID ${sectionIdStr}: '${oldSectionFolderPath}' -> '${expectedSectionFolderPath}'`);
+                        // 1. Rename the folder
+                        await plugin.app.fileManager.renameFile(
+                            vault.getAbstractFileByPath(oldSectionFolderPath) as TFolder,
+                            expectedSectionFolderPath
+                        );
 
-                } else { // file is null
+                        // 2. Rename the .md file if needed
+                        if (oldSectionFilePath) {
+                            const oldMdName = oldSectionFilePath.split('/').pop();
+                            const newMdName = `${sanitizedSectionName}.md`;
+                            if (oldMdName !== newMdName) {
+                                await plugin.app.fileManager.renameFile(
+                                    vault.getAbstractFileByPath(`${expectedSectionFolderPath}/${oldMdName}`) as TFile,
+                                    `${expectedSectionFolderPath}/${newMdName}`
+                                );
+                            }
+                        }
+
+                        // 3. Update the cache
+                        caches.sectionFileCache.set(sectionIdStr, `${expectedSectionFolderPath}/${sanitizedSectionName}.md`);
+
+                        // 4. Update the frontmatter in the .md file
+                        const sectionMdFile = vault.getAbstractFileByPath(`${expectedSectionFolderPath}/${sanitizedSectionName}.md`);
+                        if (sectionMdFile instanceof TFile) {
+                            await plugin.app.fileManager.processFrontMatter(sectionMdFile, (fm) => {
+                                fm.name = section.name;
+                            });
+                        }
+
+                        // --- Update taskFileCache paths if they start with oldSectionFolderPath ---
+                        for (const [taskId, taskPath] of caches.taskFileCache.entries()) {
+                            if (taskPath && oldSectionFolderPath && taskPath.startsWith(oldSectionFolderPath + "/")) {
+                                const newTaskPath = taskPath.replace(oldSectionFolderPath, expectedSectionFolderPath);
+                                caches.taskFileCache.set(taskId, newTaskPath);
+                                console.log(`[Cache Debug] Updated taskFileCache for ${taskId}: ${taskPath} -> ${newTaskPath}`);
+                            }
+                        }
+                    }
+                }
+
+                // --- STEP 4: Ensure section folder exists ---
+                let sectionFolder: TFolder | null = null;
+                const abstractSectionFolder = vault.getAbstractFileByPath(expectedSectionFolderPath);
+                if (abstractSectionFolder instanceof TFolder) {
+                    sectionFolder = abstractSectionFolder;
+                } else {
+                    // Create section folder if missing
+                    await vault.createFolder(expectedSectionFolderPath);
+                    const refetchedSectionFolder = vault.getAbstractFileByPath(expectedSectionFolderPath);
+                    if (refetchedSectionFolder instanceof TFolder) {
+                        sectionFolder = refetchedSectionFolder;
+                    }
+                }
+                if (!sectionFolder) {
+                    console.error(`[Obsidian Sync] Failed to create or find section folder: ${expectedSectionFolderPath}`);
+                    continue;
+                }
+
+                // --- STEP 5: Ensure section .md file exists and is up to date ---
+                let sectionFile: TFile | null = null;
+                const currentCachedSectionPath = caches.sectionFileCache.get(sectionIdStr);
+                let abstractSectionFile = currentCachedSectionPath
+                    ? vault.getAbstractFileByPath(currentCachedSectionPath)
+                    : vault.getAbstractFileByPath(expectedSectionFilePath);
+
+                if (abstractSectionFile instanceof TFile) {
+                    sectionFile = abstractSectionFile;
+                    // Check for rename/move
+                    if (sectionFile.path !== expectedSectionFilePath) {
+                        await plugin.app.fileManager.renameFile(sectionFile, expectedSectionFilePath);
+                        const renamedSectionFile = vault.getAbstractFileByPath(expectedSectionFilePath);
+                        if (renamedSectionFile instanceof TFile) {
+                            sectionFile = renamedSectionFile;
+                        }
+                    }
+                    await updateObsidianSectionFile(plugin.app, sectionFile, section, parentProject);
+                    caches.sectionFileCache.set(sectionIdStr, sectionFile.path);
+                } else {
                     // Create new section file
-                    console.log(`[Obsidian Sync] Creating new section file: ${expectedSectionFilePath}`);
-                    const newFile = await vault.create(expectedSectionFilePath, `---\n---\n`);
-                    console.log(`[Cache Debug] Section ${sectionIdStr}: Calling updateObsidianSectionFile for new file ${newFile.path}`);
-                    await updateObsidianSectionFile(plugin.app, newFile, section, parentProject);
-                    console.log(`[Cache Debug] Section ${sectionIdStr}: Setting sectionFileCache path to ${newFile.path} (created new)`);
-                    caches.sectionFileCache.set(sectionIdStr, newFile.path);
+                    const newSectionFile = await vault.create(expectedSectionFilePath, `---\n---\n`);
+                    await updateObsidianSectionFile(plugin.app, newSectionFile, section, parentProject);
+                    caches.sectionFileCache.set(sectionIdStr, newSectionFile.path);
                 }
 
             } catch (error) {
